@@ -1,0 +1,27 @@
+[project]
+name = "rl-math"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.4",
+    "transformers>=4.45",
+    "datasets>=3.0",
+    "vllm>=0.6",
+    "wandb>=0.18",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.7",
+]
+
+[project.scripts]
+train = "train:main"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
