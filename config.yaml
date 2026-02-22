@@ -1,0 +1,38 @@
+model:
+  name: Qwen/Qwen3-1.7B
+  trust_remote_code: false
+  bf16: true
+
+dataset:
+  name: qwedsacf/competition_math
+  max_rows: null
+
+training:
+  seed: 42
+  device_index: 0
+  lr: 5e-6
+  train_batch_size: 16
+  epochs_per_step: 1
+  max_norm: 1.0
+  checkpoint_path: ./output
+  checkpoint_interval: 20
+
+loss:
+  name: grpo  # grpo, dapo or reinforce++
+  clip_eps: 0.3
+  kl_beta: 0.01
+  # dapo-specific
+  clip_low: 0.2
+  clip_high: 0.28
+
+rollout:
+  group_size: 12
+  rollouts_per_step: 32
+  max_length: 1024
+  top_p: 1.0
+  temperature: 1.0
+  gpu_memory_utilization: 0.3
+
+wandb:
+  project: Reasoning
+  run_name: grpo
