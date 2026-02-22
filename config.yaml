@@ -10,7 +10,7 @@ dataset:
 training:
   seed: 42
   device_index: 0
-  lr: 5e-6
+  lr: 3e-4
   train_batch_size: 16
   epochs_per_step: 1
   max_norm: 1.0
@@ -34,5 +34,5 @@ rollout:
   gpu_memory_utilization: 0.3
 
 wandb:
-  project: Reasoning
+  project: RL
   run_name: grpo

@@ -1,5 +1,7 @@
 from collections.abc import Callable
 import argparse
+import logging
+import os
 from pathlib import Path
 import random
 import re
@@ -19,11 +21,16 @@ from transformers import (
     PreTrainedModel,
 )
 from datasets import load_dataset
+
+os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
 from vllm import LLM, SamplingParams
+logging.getLogger("vllm").setLevel(logging.WARNING)
+
 import gc
 
 from loss import approx_kl_divergence, build_loss
 from replay_buffer import ReplayBuffer, Experience, join_experience_batch
+from rewards import score_completion
 
 
 def load_config(path: str) -> dict:
@@ -88,10 +95,6 @@ def extract_boxed_answer(solution: str) -> str:
     return ""
 
 
-def normalize_answer(text: str) -> str:
-    return re.sub(r"\s+", "", text).lower().replace("\\,", "").replace("\\!", "")
-
-
 def read_prompts(
     dataset_name: str,
     predicate: Optional[Callable[[Any], bool]] = None,
@@ -107,19 +110,6 @@ def read_prompts(
     if max_rows:
         rows = rows[:max_rows]
     return rows
-
-
-def score_completion(completion: str, oracle_answer: str) -> float:
-    match = re.search(r"<answer>(.*?)</answer>", completion, flags=re.DOTALL)
-    if match is None:
-        return 0.0
-    answer = normalize_answer(match.group(1))
-    oracle = normalize_answer(oracle_answer)
-    if answer == oracle:
-        return 1.0
-    if oracle in answer:
-        return 0.5
-    return 0.01
 
 
 def create_vllm_engine(
@@ -259,7 +249,7 @@ def main(cfg: dict):
         mcfg["name"], trust_remote_code=mcfg["trust_remote_code"],
         bf16=mcfg["bf16"], device_map=device,
     )
-    optimizer = optim.Adam(model.parameters(), lr=tcfg["lr"])
+    optimizer = optim.Adam(model.parameters(), lr=float(tcfg["lr"]))
 
     reference_model.eval()
     model.gradient_checkpointing_enable(
@@ -270,7 +260,6 @@ def main(cfg: dict):
     pad_token_id = tokenizer.eos_token_id
 
     prompts = read_prompts(dcfg["name"], max_rows=dcfg.get("max_rows"))
-    print(f"loaded {len(prompts)} prompts")
     prompt_loader = DataLoader(
         prompts,
         batch_size=rcfg["rollouts_per_step"],
@@ -282,17 +271,18 @@ def main(cfg: dict):
     replay_buffer = ReplayBuffer()
     objective = build_loss(cfg["loss"])
 
-    checkpoint_path = Path(tcfg["checkpoint_path"]) if tcfg["checkpoint_path"] else None
-    checkpoint_interval = tcfg["checkpoint_interval"]
+    run_name = cfg["wandb"]["run_name"]
+    wandb.init(project=cfg["wandb"]["project"], name=run_name, config=cfg)
 
-    wandb_project = cfg["wandb"]["project"]
-    wandb_run_name = cfg["wandb"]["run_name"]
-    wandb.init(project=wandb_project, name=wandb_run_name)
+    checkpoint_dir = Path(tcfg["checkpoint_path"]) / run_name if tcfg.get("checkpoint_path") else None
+    checkpoint_interval = tcfg["checkpoint_interval"]
+    total_steps = len(prompt_loader)
+
+    print(f"training: {len(prompts)} prompts, {total_steps} steps, "
+          f"group_size={rcfg['group_size']} | run={run_name}")
 
     for k, prompt_batch in enumerate(prompt_loader):
-        rollout_returns = []
         replay_buffer.clear()
-
         questions = prompt_batch["problem"]
         answers = prompt_batch["answer"]
 
@@ -302,6 +292,8 @@ def main(cfg: dict):
             temperature=rcfg["temperature"], top_p=rcfg["top_p"],
         )
 
+        all_rewards = []
+
         model.eval()
         with torch.no_grad():
             for i, (seq_ids, returns, act_mask, completions) in enumerate(rollout_results):
@@ -309,19 +301,25 @@ def main(cfg: dict):
                 returns = returns.to(device)
                 act_mask = act_mask.to(device)
 
-                rollout_returns.append(returns.cpu())
+                all_rewards.extend(returns.squeeze(-1).tolist())
 
                 advantages = group_advantages(returns)
                 attention_mask = seq_ids != pad_token_id
 
                 log_probs = sequences_log_probs(model, seq_ids, attention_mask)
-                log_probs_ref = sequences_log_probs(reference_model, seq_ids, attention_mask)
-                kl = approx_kl_divergence(log_probs, log_probs_ref, act_mask)
+                ref_log_probs = sequences_log_probs(reference_model, seq_ids, attention_mask)
+                kl = approx_kl_divergence(log_probs, ref_log_probs, act_mask)
+
+                print(
+                    f"  rollout q='{questions[i][:50]}', a='{answers[i]}', "
+                    f"returns={returns.sum().item():.2f}, "
+                    f"buf={i+1}/{len(questions)}, seq={seq_ids.shape}"
+                )
 
                 experience = Experience(
                     sequences=seq_ids,
                     action_log_probs=log_probs,
-                    log_probs_ref=log_probs_ref,
+                    ref_log_probs=ref_log_probs,
                     returns=returns,
                     advantages=advantages,
                     attention_mask=attention_mask,
@@ -331,8 +329,10 @@ def main(cfg: dict):
                 replay_buffer.append(experience.to(cpu_device))
 
         torch.cuda.empty_cache()
-        episode_return_sum = torch.stack(rollout_returns).sum()
-        wandb.log({"returns": episode_return_sum})
+
+        reward_mean = sum(all_rewards) / len(all_rewards)
+        accuracy = sum(1 for r in all_rewards if r >= 0.8) / len(all_rewards)
+        print(f"returns of step {k}: reward={reward_mean:.3f}, acc={accuracy:.1%}")
 
         experience_sampler = DataLoader(
             replay_buffer,
@@ -342,9 +342,8 @@ def main(cfg: dict):
             collate_fn=join_experience_batch,
         )
 
-        for step_epoch in range(tcfg["epochs_per_step"]):
+        for epoch in range(tcfg["epochs_per_step"]):
             model.train()
-
             for exp in experience_sampler:
                 exp = exp.to(device)
                 optimizer.zero_grad()
@@ -355,22 +354,40 @@ def main(cfg: dict):
                 loss, kl = objective(log_probs=log_probs, experience=exp)
 
                 if not loss.isfinite():
+                    print(f"  loss not finite, skipping: {loss.item()}")
                     continue
 
                 loss.backward()
                 grad_norm = clip_grad_norm_(model.parameters(), max_norm=tcfg["max_norm"])
-                wandb.log({"kl": kl, "grad_norm": grad_norm, "loss": loss})
                 optimizer.step()
+
+                print(f"  {epoch}: kl={kl.item():.4f}, grad_norm={grad_norm.item():.4f}, loss={loss.item():.4f}")
+
+        wandb.log({
+            "rollout/reward_mean": reward_mean,
+            "rollout/accuracy": accuracy,
+            "train/loss": loss.item(),
+            "train/kl": kl.item(),
+            "train/grad_norm": grad_norm.item(),
+        }, step=k)
 
         vllm_engine = sync_vllm_weights(
             model, tokenizer, vllm_engine, rcfg["gpu_memory_utilization"],
         )
 
-        if checkpoint_path and checkpoint_interval and (k + 1) % checkpoint_interval == 0:
-            model.save_pretrained(checkpoint_path / f"step_{k}")
+        if checkpoint_dir and checkpoint_interval and (k + 1) % checkpoint_interval == 0:
+            save_path = checkpoint_dir / f"step_{k+1}"
+            model.save_pretrained(save_path)
+            tokenizer.save_pretrained(save_path)
+            print(f"  checkpoint saved: {save_path}")
 
-    if checkpoint_path:
-        model.save_pretrained(checkpoint_path / "final")
+    if checkpoint_dir:
+        save_path = checkpoint_dir / "final"
+        model.save_pretrained(save_path)
+        tokenizer.save_pretrained(save_path)
+        print(f"saved final: {save_path}")
+
+    wandb.finish()
 
 
 if __name__ == "__main__":
