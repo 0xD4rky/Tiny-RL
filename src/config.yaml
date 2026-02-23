@@ -10,15 +10,16 @@ dataset:
 training:
   seed: 42
   device_index: 0
-  lr: 3e-4
-  train_batch_size: 16
+  lr: 1e-5
+  train_batch_size: 4
+  grad_acc_steps: 4
   epochs_per_step: 1
   max_norm: 1.0
   checkpoint_path: ./output
   checkpoint_interval: 20
 
 loss:
-  name: grpo  # grpo, dapo or reinforce++
+  name: grpo  # grpo, dapo or reinforce_pp
   clip_eps: 0.3
   kl_beta: 0.01
   # dapo-specific
@@ -28,10 +29,11 @@ loss:
 rollout:
   group_size: 12
   rollouts_per_step: 32
-  max_length: 1024
+  max_length: 2048
   top_p: 1.0
   temperature: 1.0
   gpu_memory_utilization: 0.3
+  sync_interval: 2
 
 wandb:
   project: RL

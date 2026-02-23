@@ -111,11 +111,19 @@ class Rewards:
 
         return False
 
-    def score_correctness(self,completion: str, oracle_answer: str) -> float:
+    def extract_predicted_answer(self, completion: str) -> str | None:
         match = re.search(r"<answer>(.*?)</answer>", completion, flags=re.DOTALL)
-        if match is None:
+        if match:
+            return match.group(1).strip()
+        boxed = extract_boxed_answer(completion)
+        if boxed:
+            return boxed.strip()
+        return None
+
+    def score_correctness(self, completion: str, oracle_answer: str) -> float:
+        predicted = self.extract_predicted_answer(completion)
+        if predicted is None:
             return 0.0
-        predicted = match.group(1).strip()
         return 1.0 if self.answers_match(predicted, oracle_answer) else 0.0
 
 
@@ -143,8 +151,17 @@ class Rewards:
                 return -0.2
         return 0.1
 
+    def score_truncation(self, completion: str) -> float:
+        has_think_open = "<think>" in completion
+        has_think_close = "</think>" in completion
+        has_answer = self.extract_predicted_answer(completion) is not None
+        if has_think_open and not has_think_close and not has_answer:
+            return -0.1
+        return 0.0
+
     def score_completion(self, completion: str, oracle_answer: str) -> float:
         correctness = self.score_correctness(completion, oracle_answer)
         fmt = self.score_format(completion)
         reasoning = self.score_reasoning(completion) if correctness >= 1.0 else 0.0
-        return correctness + fmt + reasoning
+        truncation = self.score_truncation(completion) if correctness == 0.0 else 0.0
+        return correctness + fmt + reasoning + truncation

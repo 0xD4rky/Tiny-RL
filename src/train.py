@@ -83,7 +83,6 @@ def format_prompt(tokenizer: PreTrainedTokenizer, question: str) -> str:
 
 def read_prompts(
     dataset_name: str,
-    predicate: Optional[Callable[[Any], bool]] = None,
     max_rows: Optional[int] = None,
 ) -> list:
     dataset = load_dataset(dataset_name, split="train")
@@ -91,10 +90,6 @@ def read_prompts(
     for r in rows:
         r["answer"] = extract_boxed_answer(r["solution"])
     rows = [r for r in rows if r["answer"]]
-    if predicate:
-        rows = [r for r in rows if predicate(r)]
-    if max_rows:
-        rows = rows[:max_rows]
     return rows
 
 
@@ -143,17 +138,18 @@ def vllm_rollout(
     top_p: float,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]]:
     prompts = [format_prompt(tokenizer, q) for q in questions]
-    prompt_lens = [len(tokenizer.encode(p)) for p in prompts]
-    max_tokens = max(max_length - max(prompt_lens), 1)
 
     outputs = engine.generate(
         prompts,
-        SamplingParams(
-            n=group_size,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-        ),
+        [
+            SamplingParams(
+                n=group_size,
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max(max_length - len(tokenizer.encode(p)), 1),
+            )
+            for p in prompts
+        ],
     )
 
     pad_token_id = tokenizer.eos_token_id
@@ -163,12 +159,13 @@ def vllm_rollout(
         prompt_ids = list(output.prompt_token_ids)
         prompt_len = len(prompt_ids)
 
+        scorer = Rewards()
         seqs, completions, rewards = [], [], []
         for comp in output.outputs:
             full_ids = prompt_ids + list(comp.token_ids)
             seqs.append(full_ids)
             completions.append(comp.text)
-            rewards.append(Rewards.score_completion(comp.text, oracle))
+            rewards.append(scorer.score_completion(comp.text, oracle))
 
         max_seq_len = max(len(s) for s in seqs)
         sequence_ids = torch.full((group_size, max_seq_len), pad_token_id, dtype=torch.long)
@@ -194,31 +191,41 @@ def group_advantages(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 
 def sequence_log_probs_from_logits(
-    logits: torch.tensor, output_ids: torch.tensor
+    logits: torch.Tensor, output_ids: torch.Tensor
 ) -> torch.Tensor:
-    log_prob = F.log_softmax(logits, dim=-1)
-    return log_prob.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
+    return -F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        output_ids.reshape(-1),
+        reduction="none",
+    ).reshape(output_ids.shape)
 
 
 def sequences_log_probs(
     model: PreTrainedModel,
     sequence_ids: torch.Tensor,
     attention_mask: torch.Tensor,
+    chunk_size: int = 4,
 ) -> torch.Tensor:
-    position_ids = attention_mask.long().cumsum(dim=-1) - 1
-    position_ids.masked_fill_(mask=(attention_mask == 0), value=1)
-    output = model.forward(
-        input_ids=sequence_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        use_cache=False,
-    )
-    logits = output["logits"]
-    log_probs = sequence_log_probs_from_logits(
-        logits=logits[:, :-1].to(torch.float32),
-        output_ids=sequence_ids[:, 1:],
-    )
-    return log_probs
+    all_log_probs = []
+    for i in range(0, sequence_ids.shape[0], chunk_size):
+        chunk_ids = sequence_ids[i : i + chunk_size]
+        chunk_mask = attention_mask[i : i + chunk_size]
+        position_ids = chunk_mask.long().cumsum(dim=-1) - 1
+        position_ids.masked_fill_(mask=(chunk_mask == 0), value=1)
+        output = model.forward(
+            input_ids=chunk_ids,
+            attention_mask=chunk_mask,
+            position_ids=position_ids,
+            use_cache=False,
+        )
+        logits = output["logits"]
+        log_probs = sequence_log_probs_from_logits(
+            logits=logits[:, :-1].to(torch.float32),
+            output_ids=chunk_ids[:, 1:],
+        )
+        all_log_probs.append(log_probs)
+        del output, logits
+    return torch.cat(all_log_probs, dim=0)
 
 def main(cfg: dict):
     tcfg, mcfg, rcfg, dcfg = cfg["training"], cfg["model"], cfg["rollout"], cfg["dataset"]
@@ -290,17 +297,19 @@ def main(cfg: dict):
                 all_rewards.extend(returns.squeeze(-1).tolist())
 
                 advantages = group_advantages(returns)
-                attention_mask = seq_ids != pad_token_id
-
-                log_probs = sequences_log_probs(model, seq_ids, attention_mask)
-                ref_log_probs = sequences_log_probs(reference_model, seq_ids, attention_mask)
-                kl = approx_kl_divergence(log_probs, ref_log_probs, act_mask)
 
                 print(
                     f"  rollout q='{questions[i][:50]}', a='{answers[i]}', "
                     f"returns={returns.sum().item():.2f}, "
                     f"buf={i+1}/{len(questions)}, seq={seq_ids.shape}"
                 )
+                if i == 0:
+                    print(f"[sample completion]\n{completions[0]}\n  [/sample]")
+
+                attention_mask = seq_ids != pad_token_id
+                log_probs = sequences_log_probs(model, seq_ids, attention_mask)
+                ref_log_probs = sequences_log_probs(reference_model, seq_ids, attention_mask)
+                kl = approx_kl_divergence(log_probs, ref_log_probs, act_mask)
 
                 experience = Experience(
                     sequences=seq_ids,
@@ -320,6 +329,10 @@ def main(cfg: dict):
         accuracy = sum(1 for r in all_rewards if r >= 0.8) / len(all_rewards)
         print(f"returns of step {k}: reward={reward_mean:.3f}, acc={accuracy:.1%}")
 
+        if len(replay_buffer) < tcfg["train_batch_size"]:
+            print(f"skipping training: not enough signal ({len(replay_buffer)} experiences)")
+            continue
+
         experience_sampler = DataLoader(
             replay_buffer,
             batch_size=tcfg["train_batch_size"],
@@ -328,26 +341,31 @@ def main(cfg: dict):
             collate_fn=join_experience_batch,
         )
 
+        grad_acc_steps = tcfg.get("grad_acc_steps", 1)
+
         for epoch in range(tcfg["epochs_per_step"]):
             model.train()
-            for exp in experience_sampler:
+            optimizer.zero_grad()
+            for micro_step, exp in enumerate(experience_sampler):
                 exp = exp.to(device)
-                optimizer.zero_grad()
 
                 log_probs = sequences_log_probs(
                     model, sequence_ids=exp.sequences, attention_mask=exp.attention_mask
                 )
                 loss, kl = objective(log_probs=log_probs, experience=exp)
+                loss = loss / grad_acc_steps
 
                 if not loss.isfinite():
                     print(f"  loss not finite, skipping: {loss.item()}")
                     continue
 
                 loss.backward()
-                grad_norm = clip_grad_norm_(model.parameters(), max_norm=tcfg["max_norm"])
-                optimizer.step()
 
-                print(f"  {epoch}: kl={kl.item():.4f}, grad_norm={grad_norm.item():.4f}, loss={loss.item():.4f}")
+                if (micro_step + 1) % grad_acc_steps == 0:
+                    grad_norm = clip_grad_norm_(model.parameters(), max_norm=tcfg["max_norm"])
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    print(f"  {epoch}: kl={kl.item():.4f}, grad_norm={grad_norm.item():.4f}, loss={loss.item():.4f}")
 
         wandb.log({
             "rollout/reward_mean": reward_mean,
@@ -357,9 +375,11 @@ def main(cfg: dict):
             "train/grad_norm": grad_norm.item(),
         }, step=k)
 
-        vllm_engine = sync_vllm_weights(
-            model, tokenizer, vllm_engine, rcfg["gpu_memory_utilization"],
-        )
+        sync_interval = rcfg.get("sync_interval", 1)
+        if (k + 1) % sync_interval == 0:
+            vllm_engine = sync_vllm_weights(
+                model, tokenizer, vllm_engine, rcfg["gpu_memory_utilization"],
+            )
 
         if checkpoint_dir and checkpoint_interval and (k + 1) % checkpoint_interval == 0:
             save_path = checkpoint_dir / f"step_{k+1}"
