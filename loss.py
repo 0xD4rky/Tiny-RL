@@ -68,10 +68,11 @@ class DAPOLoss(nn.Module):
     dapo actor loss
     """
 
-    def __init__(self, clip_low: float = 0.2, clip_high: float = 0.28) -> None:
+    def __init__(self, clip_low: float = 0.2, clip_high: float = 0.28, ent_coef: float = 0.001) -> None:
         super().__init__()
         self.clip_low = clip_low
         self.clip_high = clip_high
+        self.ent_coef = ent_coef
 
     def forward(
         self,
@@ -94,11 +95,13 @@ class DAPOLoss(nn.Module):
         clipped_ratio = torch.clamp(ratio, 1 - self.clip_low, 1 + self.clip_high)
 
         surrogate = torch.min(ratio * advantages, clipped_ratio * advantages)
+        entropy_bonus = -log_probs # to prevent entropy collapse
+        token_loss = -surrogate - self.ent_coef * entropy_bonus
 
         if action_mask is not None:
-            loss = -(surrogate * action_mask).sum() / action_mask.sum()
+            loss = (token_loss * action_mask).sum() / action_mask.sum()
         else:
-            loss = -surrogate.mean()
+            loss = token_loss.mean()
 
         return loss, kl.mean()
 
@@ -149,7 +152,7 @@ LOSS_REGISTRY: Dict[str, type] = {
 
 LOSS_ARGS: Dict[str, list[str]] = {
     "grpo": ["clip_eps", "kl_beta"],
-    "dapo": ["clip_low", "clip_high"],
+    "dapo": ["clip_low", "clip_high", "ent_coef"],
     "reinforce_pp": ["clip_eps", "kl_beta"],
 }
 

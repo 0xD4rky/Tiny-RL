@@ -30,7 +30,7 @@ import gc
 
 from loss import approx_kl_divergence, build_loss
 from replay_buffer import ReplayBuffer, Experience, join_experience_batch
-from rewards import score_completion
+from rewards import Rewards, extract_boxed_answer
 
 
 def load_config(path: str) -> dict:
@@ -79,20 +79,6 @@ def format_prompt(tokenizer: PreTrainedTokenizer, question: str) -> str:
         tokenize=False,
         add_generation_prompt=True,
     )
-
-def extract_boxed_answer(solution: str) -> str:
-    idx = solution.rfind("\\boxed{")
-    if idx == -1:
-        return ""
-    depth, start = 0, idx + len("\\boxed{")
-    for i in range(start, len(solution)):
-        if solution[i] == "{":
-            depth += 1
-        elif solution[i] == "}":
-            if depth == 0:
-                return solution[start:i].strip()
-            depth -= 1
-    return ""
 
 
 def read_prompts(
@@ -182,7 +168,7 @@ def vllm_rollout(
             full_ids = prompt_ids + list(comp.token_ids)
             seqs.append(full_ids)
             completions.append(comp.text)
-            rewards.append(score_completion(comp.text, oracle))
+            rewards.append(Rewards.score_completion(comp.text, oracle))
 
         max_seq_len = max(len(s) for s in seqs)
         sequence_ids = torch.full((group_size, max_seq_len), pad_token_id, dtype=torch.long)
