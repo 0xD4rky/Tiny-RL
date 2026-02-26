@@ -36,7 +36,7 @@ from transformers import AutoConfig
 
 from loss import approx_kl_divergence, build_loss
 from replay_buffer import Experience, ReplayBuffer, join_experience_batch
-from train import load_config, load_model, sequences_log_probs, init_rng
+from utils import load_config, load_model, sequences_log_probs, init_rng
 
 log = logging.getLogger(__name__)
 app = FastAPI()
