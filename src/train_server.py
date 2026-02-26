@@ -29,7 +29,7 @@ from torch.distributed.fsdp import (
     ShardingStrategy,
     StateDictType,
 )
-from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
@@ -44,14 +44,26 @@ app = FastAPI()
 
 # ── FSDP helper ──────────────────────────────────────────────────────
 
-def _wrap_fsdp(model, cfg):
-    fsdp_cfg = cfg.get("fsdp", {})
+def _wrap_fsdp(model):
+    # Use transformer_auto_wrap_policy based on the model's _no_split_modules.
+    # This wraps at decoder-layer boundaries and avoids FSDP sharding lm_head
+    # and embed_tokens into separate units (which causes size mismatches).
+    layer_classes = set()
+    if hasattr(model, "_no_split_modules"):
+        for cls_name in model._no_split_modules:
+            for module in model.modules():
+                if type(module).__name__ == cls_name:
+                    layer_classes.add(type(module))
+                    break
+
+    wrap_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls=layer_classes,
+    )
+
     return FSDP(
         model,
-        auto_wrap_policy=functools.partial(
-            size_based_auto_wrap_policy,
-            min_num_params=int(fsdp_cfg.get("min_num_params", 1e7)),
-        ),
+        auto_wrap_policy=wrap_policy,
         mixed_precision=MixedPrecision(
             param_dtype=torch.bfloat16,
             reduce_dtype=torch.bfloat16,
@@ -70,8 +82,8 @@ class TrainServer:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         mcfg, tcfg = cfg["model"], cfg["training"]
-        self.rank = dist.get_global_rank()
-        self.device = torch.device("cuda", dist.get_local_rank())
+        self.rank = dist.get_rank()
+        self.device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 
         # policy model (trainable, FSDP)
         model, self.tokenizer = load_model(
@@ -82,7 +94,7 @@ class TrainServer:
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False},
         )
-        self.model = _wrap_fsdp(model, cfg)
+        self.model = _wrap_fsdp(model)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(tcfg["lr"]))
         self.objective = build_loss(cfg["loss"])
 
@@ -92,7 +104,7 @@ class TrainServer:
             bf16=mcfg["bf16"], device_map=None,
         )
         ref.to(self.device)
-        self.ref_model = _wrap_fsdp(ref, cfg)
+        self.ref_model = _wrap_fsdp(ref)
         self.ref_model.eval()
 
         self.pad_id = self.tokenizer.eos_token_id
@@ -220,6 +232,6 @@ if __name__ == "__main__":
     init_rng(cfg["training"]["seed"])
     server = TrainServer(cfg)
 
-    port = args.port + dist.get_local_rank()
-    log.info("Train server rank %d on port %d", dist.get_global_rank(), port)
+    port = args.port + int(os.environ["LOCAL_RANK"])
+    log.info("Train server rank %d on port %d", dist.get_rank(), port)
     uvicorn.run(app, host="0.0.0.0", port=port)
