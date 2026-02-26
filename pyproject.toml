@@ -10,6 +10,10 @@ dependencies = [
     "wandb>=0.18",
     "pyyaml>=6.0",
     "accelerate>=1.12.0",
+    "aiohttp>=3.9",
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]

@@ -7,9 +7,20 @@ dataset:
   name: qwedsacf/competition_math
   max_rows: null
 
+gpu_split:
+  train: [0, 1, 2, 3]              # GPUs for FSDP training
+  inference: [4, 5, 6, 7]          # GPUs for vLLM inference
+
+server:
+  train_url: http://localhost       # base URL for train servers
+  train_port: 5000                  # rank i serves on train_port + i
+  weights_dir: .vllm_weights        # shared dir for weight sync
+
+fsdp:
+  min_num_params: 10000000          # FSDP auto-wrap threshold
+
 training:
   seed: 42
-  device_index: 0
   lr: 1e-5
   train_batch_size: 4
   grad_acc_steps: 4
