@@ -57,10 +57,14 @@ async def run(cfg: dict):
     await train_engine.wait_for_ready()
 
     # ── vLLM (local, for rollout generation) ─────────────────────────
-    log.info("Creating vLLM engine ...")
+    n_inference_gpus = len(cfg.get("gpu_split", {}).get("inference", [0]))
+    log.info("Creating vLLM engine on %d GPU(s) ...", n_inference_gpus)
     _, tokenizer = load_model(mcfg["name"], trust_remote_code=mcfg["trust_remote_code"],
                               bf16=mcfg["bf16"], device_map="cpu")
-    engine = create_vllm_engine(mcfg["name"], rcfg["gpu_memory_utilization"], rcfg["max_length"])
+    engine = create_vllm_engine(
+        mcfg["name"], rcfg["gpu_memory_utilization"], rcfg["max_length"],
+        tensor_parallel_size=n_inference_gpus,
+    )
     pad_id = tokenizer.eos_token_id
 
     # ── data ─────────────────────────────────────────────────────────
@@ -130,6 +134,7 @@ async def run(cfg: dict):
             destroy_vllm_engine(engine)
             engine = create_vllm_engine(
                 weights_dir, rcfg["gpu_memory_utilization"], rcfg["max_length"],
+                tensor_parallel_size=n_inference_gpus,
             )
             log.info("vLLM reloaded from %s", weights_dir)
 

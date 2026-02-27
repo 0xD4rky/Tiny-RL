@@ -87,12 +87,14 @@ def create_vllm_engine(
     model_path: str,
     gpu_memory_utilization: float = 0.3,
     max_model_len: int = 2048,
+    tensor_parallel_size: int = 1,
 ) -> LLM:
     return LLM(
         model=model_path,
         dtype="bfloat16",
         gpu_memory_utilization=gpu_memory_utilization,
         max_model_len=max_model_len,
+        tensor_parallel_size=tensor_parallel_size,
         enforce_eager=True,
     )
 
