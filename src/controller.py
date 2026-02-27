@@ -18,8 +18,8 @@ import argparse
 import asyncio
 import logging
 from pathlib import Path
+import time
 
-import torch
 import wandb
 from torch.utils.data import DataLoader
 
@@ -87,45 +87,55 @@ async def run(cfg: dict):
         answers = list(batch["answer"])
 
         # 1) generate rollouts with vLLM
+        t_rollout = time.perf_counter()
         results = vllm_rollout(
             engine, tokenizer, questions, answers,
             group_size=rcfg["group_size"], max_length=rcfg["max_length"],
             temperature=rcfg["temperature"], top_p=rcfg["top_p"],
         )
+        rollout_time = time.perf_counter() - t_rollout
 
         # package as JSON-serialisable dicts
         rollout_batches: list[dict] = []
         all_rewards: list[float] = []
-        for seq_ids, returns, act_mask, _completions in results:
+        total_generated_tokens = 0
+        for seq_ids, returns, act_mask, vllm_lp, _completions in results:
             attn_mask = seq_ids != pad_id
             adv = group_advantages(returns)
             all_rewards.extend(returns.squeeze(-1).tolist())
+            total_generated_tokens += int(act_mask.sum())
             rollout_batches.append({
                 "sequences": seq_ids.tolist(),
                 "returns": returns.tolist(),
                 "advantages": adv.tolist(),
                 "action_mask": act_mask.tolist(),
                 "attention_mask": attn_mask.tolist(),
+                "action_log_probs": vllm_lp.tolist(),
             })
 
+        rollout_tps = total_generated_tokens / rollout_time
         reward_mean = sum(all_rewards) / len(all_rewards)
         accuracy = sum(1 for r in all_rewards if r >= 0.8) / len(all_rewards)
-        log.info("Step %d: reward=%.3f acc=%.1f%%", k, reward_mean, accuracy * 100)
+        log.info("Step %d: reward=%.3f acc=%.1f%% | rollout %.0f tok/s",
+                 k, reward_mean, accuracy * 100, rollout_tps)
 
         # 2) send to train servers  (all ranks receive the same data)
         await train_engine.create_online_dataset(rollout_batches)
 
         # 3) train
-        results = await train_engine.train_1_iter()
-        metrics = results[0].get("metrics", {})
+        train_results = await train_engine.train_1_iter()
+        metrics = train_results[0].get("metrics", {})
 
         if metrics:
             wandb.log({
                 "rollout/reward_mean": reward_mean,
                 "rollout/accuracy": accuracy,
+                "rollout/tokens_per_sec": rollout_tps,
                 "train/loss": metrics["loss"],
                 "train/kl": metrics["kl"],
                 "train/grad_norm": metrics["grad_norm"],
+                "train/tokens_per_sec": metrics.get("tokens_per_sec"),
+                "train/mfu": metrics.get("mfu"),
             }, step=k)
 
         # 4) sync weights → reload vLLM

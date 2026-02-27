@@ -16,6 +16,7 @@ import functools
 import logging
 import os
 from pathlib import Path
+import time
 
 import torch
 import torch.distributed as dist
@@ -40,6 +41,18 @@ from utils import load_config, load_model, sequences_log_probs, init_rng
 
 log = logging.getLogger(__name__)
 app = FastAPI()
+
+
+# ── GPU peak TFLOPS (BF16 tensor core) ───────────────────────────────
+
+def _gpu_peak_tflops(device: torch.device) -> float | None:
+    name = torch.cuda.get_device_properties(device).name.lower()
+    if "h200"  in name: return 1979.0
+    if "h100"  in name: return 989.0
+    if "a100"  in name: return 312.0
+    if "a6000" in name: return 154.0
+    if "4090"  in name: return 165.0
+    return None
 
 
 # ── FSDP helper ──────────────────────────────────────────────────────
@@ -91,6 +104,7 @@ class TrainServer:
             bf16=mcfg["bf16"], device_map=None,
         )
         model.to(self.device)
+        self.num_params = sum(p.numel() for p in model.parameters())
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False},
         )
@@ -115,20 +129,24 @@ class TrainServer:
     # ── /create_online_dataset ───────────────────────────────────────
 
     def create_online_dataset(self, rollout_batches: list[dict]):
-        """Compute policy + ref log-probs and buffer for training."""
+        """Buffer rollout data for training.
+
+        action_log_probs come directly from vLLM (computed at generation time
+        under the same policy that produced the tokens), so we only need one
+        forward pass here — the reference model for KL.
+        """
         self.replay.clear()
-        self.model.eval()
         with torch.no_grad():
             for d in rollout_batches:
-                seq = torch.tensor(d["sequences"], dtype=torch.long, device=self.device)
-                attn = torch.tensor(d["attention_mask"], dtype=torch.bool, device=self.device)
-                act = torch.tensor(d["action_mask"], dtype=torch.bool, device=self.device)
-                lp = sequences_log_probs(self.model, seq, attn)
+                seq  = torch.tensor(d["sequences"],        dtype=torch.long,  device=self.device)
+                attn = torch.tensor(d["attention_mask"],   dtype=torch.bool,  device=self.device)
+                act  = torch.tensor(d["action_mask"],      dtype=torch.bool,  device=self.device)
+                lp   = torch.tensor(d["action_log_probs"], dtype=torch.float, device=self.device)
                 ref_lp = sequences_log_probs(self.ref_model, seq, attn)
                 kl = approx_kl_divergence(lp, ref_lp, act)
                 self.replay.append(Experience(
                     sequences=seq, action_log_probs=lp, ref_log_probs=ref_lp,
-                    returns=torch.tensor(d["returns"], dtype=torch.float, device=self.device),
+                    returns=torch.tensor(d["returns"],    dtype=torch.float, device=self.device),
                     advantages=torch.tensor(d["advantages"], dtype=torch.float, device=self.device),
                     action_mask=act, attention_mask=attn, kl=kl,
                 ).to(torch.device("cpu")))
@@ -148,12 +166,17 @@ class TrainServer:
         )
         grad_acc = tcfg.get("grad_acc_steps", 1)
         metrics: dict = {}
+        total_tokens = 0
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
 
         for epoch in range(tcfg["epochs_per_step"]):
             self.model.train()
             self.optimizer.zero_grad()
             for micro, exp in enumerate(loader):
                 exp = exp.to(self.device)
+                total_tokens += int(exp.attention_mask.sum())
                 lp = sequences_log_probs(self.model, exp.sequences, exp.attention_mask)
                 loss, kl = self.objective(log_probs=lp, experience=exp)
                 (loss / grad_acc).backward()
@@ -162,6 +185,23 @@ class TrainServer:
                     self.optimizer.step()
                     self.optimizer.zero_grad()
                     metrics = {"loss": loss.item(), "kl": kl.item(), "grad_norm": gn.item()}
+
+        torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+
+        # throughput
+        tokens_per_sec = total_tokens / elapsed
+
+        # MFU: 6*N*T flops (2 fwd + 4 bwd) across all train GPUs
+        world_size = dist.get_world_size()
+        peak_tflops = _gpu_peak_tflops(self.device)
+        if peak_tflops and elapsed > 0:
+            actual_tflops = 6 * self.num_params * total_tokens / elapsed / 1e12
+            mfu = actual_tflops / (world_size * peak_tflops)
+        else:
+            mfu = None
+
+        metrics.update({"tokens_per_sec": tokens_per_sec, "mfu": mfu})
         return {"status": "ok", "metrics": metrics}
 
     # ── /save_weights ────────────────────────────────────────────────

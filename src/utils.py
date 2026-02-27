@@ -114,7 +114,7 @@ def vllm_rollout(
     max_length: int,
     temperature: float,
     top_p: float,
-) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]]:
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str]]]:
     prompts = [format_prompt(tokenizer, q) for q in questions]
 
     outputs = engine.generate(
@@ -125,6 +125,7 @@ def vllm_rollout(
                 temperature=temperature,
                 top_p=top_p,
                 max_tokens=max(max_length - len(tokenizer.encode(p)), 1),
+                logprobs=1,  # capture log prob of each sampled token
             )
             for p in prompts
         ],
@@ -138,23 +139,33 @@ def vllm_rollout(
         prompt_len = len(prompt_ids)
 
         scorer = Rewards()
-        seqs, completions, rewards = [], [], []
+        seqs, completions, rewards, gen_log_probs = [], [], [], []
         for comp in output.outputs:
             full_ids = prompt_ids + list(comp.token_ids)
             seqs.append(full_ids)
             completions.append(comp.text)
             rewards.append(scorer.score_completion(comp.text, oracle))
+            # comp.logprobs: list[dict[token_id -> Logprob]], one entry per generated token
+            gen_log_probs.append([
+                lp_dict[tok_id].logprob
+                for tok_id, lp_dict in zip(comp.token_ids, comp.logprobs)
+            ])
 
         max_seq_len = max(len(s) for s in seqs)
         sequence_ids = torch.full((group_size, max_seq_len), pad_token_id, dtype=torch.long)
         action_mask = torch.zeros(group_size, max_seq_len - 1, dtype=torch.bool)
+        action_log_probs = torch.zeros(group_size, max_seq_len - 1, dtype=torch.float32)
 
-        for i, seq in enumerate(seqs):
+        for i, (seq, lps) in enumerate(zip(seqs, gen_log_probs)):
             sequence_ids[i, : len(seq)] = torch.tensor(seq, dtype=torch.long)
             action_mask[i, prompt_len - 1 : len(seq) - 1] = True
+            # generated tokens occupy positions [prompt_len-1 : prompt_len-1+gen_len]
+            # in the (seq_len - 1) log-prob space
+            gen_len = len(lps)
+            action_log_probs[i, prompt_len - 1 : prompt_len - 1 + gen_len] = torch.tensor(lps)
 
         returns = torch.tensor(rewards, dtype=torch.float).unsqueeze(1)
-        results.append((sequence_ids, returns, action_mask, completions))
+        results.append((sequence_ids, returns, action_mask, action_log_probs, completions))
 
     return results
 
