@@ -14,7 +14,7 @@ gpu_split:
 server:
   train_url: http://localhost       # base URL for train servers
   train_port: 5000                  # rank i serves on train_port + i
-  weights_dir: .vllm_weights        # shared dir for weight sync
+  weights_dir: /dev/shm/vllm_weights  # RAM filesystem — eliminates disk I/O on weight sync
 
 
 training:

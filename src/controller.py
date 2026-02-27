@@ -140,13 +140,16 @@ async def run(cfg: dict):
 
         # 4) sync weights → reload vLLM
         if (k + 1) % sync_interval == 0:
+            t_sync = time.perf_counter()
             await train_engine.save_weights()
             destroy_vllm_engine(engine)
             engine = create_vllm_engine(
                 weights_dir, rcfg["gpu_memory_utilization"], rcfg["max_length"],
                 tensor_parallel_size=n_inference_gpus,
             )
-            log.info("vLLM reloaded from %s", weights_dir)
+            sync_time = time.perf_counter() - t_sync
+            log.info("vLLM reloaded from %s (%.1fs)", weights_dir, sync_time)
+            wandb.log({"sync/weight_sync_time": sync_time}, step=k)
 
         # 5) checkpoint
         if (k + 1) % tcfg["checkpoint_interval"] == 0:
