@@ -1,8 +1,8 @@
 """
 Single entry point for the full RL training pipeline.
 
-Splits GPUs between training (FSDP) and inference (vLLM), launches
-train servers as a subprocess, then runs the asyncio controller.
+Splits GPUs between training and inference, launches train and rollout
+servers as subprocesses, then runs the asyncio controller.
 
 Usage:
     python launch.py --config config.yaml
@@ -37,10 +37,11 @@ def main():
     inference_gpus = gpu_split.get("inference", [1])
 
     scfg = cfg.get("server", {})
-    port = scfg.get("train_port", 5000)
+    train_port = scfg.get("train_port", 5000)
+    rollout_port = scfg.get("rollout_port", 7000)
 
-    # Set inference GPUs for this process (controller + vLLM)
-    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in inference_gpus)
+    # Keep controller CPU-only; rollout server owns inference GPUs.
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
     # Ensure controller sees correct number of train ranks
     cfg.setdefault("fsdp", {})["num_gpus"] = len(train_gpus)
@@ -52,30 +53,42 @@ def main():
         f"--nproc_per_node={len(train_gpus)}",
         str(src_dir / "train_server.py"),
         "--config", config_path,
-        "--port", str(port),
+        "--port", str(train_port),
     ]
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in train_gpus)
+    train_env = os.environ.copy()
+    train_env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in train_gpus)
+
+    rollout_cmd = [
+        sys.executable,
+        str(src_dir / "rollout_server.py"),
+        "--config", config_path,
+        "--port", str(rollout_port),
+    ]
+    rollout_env = os.environ.copy()
+    rollout_env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in inference_gpus)
 
     log.info("Launching train servers on GPUs %s ...", train_gpus)
-    train_proc = subprocess.Popen(cmd, env=env)
+    train_proc = subprocess.Popen(cmd, env=train_env)
+    log.info("Launching rollout server on GPUs %s ...", inference_gpus)
+    rollout_proc = subprocess.Popen(rollout_cmd, env=rollout_env)
 
     try:
-        # Import controller *after* CUDA_VISIBLE_DEVICES is set so vLLM
-        # only sees the inference GPUs.
+        # Import controller after process env setup.
         from controller import run as run_controller
 
         asyncio.run(run_controller(cfg))
     except KeyboardInterrupt:
         log.info("Interrupted.")
     finally:
-        if train_proc.poll() is None:
-            log.info("Terminating train servers ...")
-            train_proc.terminate()
-            try:
-                train_proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                train_proc.kill()
+        procs = [(rollout_proc, "rollout server"), (train_proc, "train servers")]
+        for proc, label in procs:
+            if proc.poll() is None:
+                log.info("Terminating %s ...", label)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=15)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
         log.info("Done.")
 
 

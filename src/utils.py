@@ -15,7 +15,6 @@ from transformers import (
 from datasets import load_dataset
 
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
-from vllm import LLM, SamplingParams
 logging.getLogger("vllm").setLevel(logging.WARNING)
 
 import gc
@@ -88,7 +87,9 @@ def create_vllm_engine(
     gpu_memory_utilization: float = 0.3,
     max_model_len: int = 2048,
     tensor_parallel_size: int = 1,
-) -> LLM:
+) -> "LLM":
+    from vllm import LLM
+
     return LLM(
         model=model_path,
         dtype="bfloat16",
@@ -99,14 +100,14 @@ def create_vllm_engine(
     )
 
 
-def destroy_vllm_engine(engine: LLM):
+def destroy_vllm_engine(engine: "LLM"):
     del engine
     gc.collect()
     torch.cuda.empty_cache()
 
 
 def vllm_rollout(
-    engine: LLM,
+    engine: "LLM",
     tokenizer: PreTrainedTokenizer,
     questions: list[str],
     answers: list[str],
@@ -115,6 +116,8 @@ def vllm_rollout(
     temperature: float,
     top_p: float,
 ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[str]]]:
+    from vllm import SamplingParams
+
     prompts = [format_prompt(tokenizer, q) for q in questions]
 
     outputs = engine.generate(

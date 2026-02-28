@@ -12,11 +12,11 @@ Usage:
 """
 
 import argparse
-import functools
 import logging
 import os
 from pathlib import Path
 import time
+from contextlib import contextmanager
 from typing import Iterator
 
 import torch
@@ -24,14 +24,7 @@ import torch.distributed as dist
 import uvicorn
 from fastapi import FastAPI, Request
 from safetensors.torch import save_file
-from torch.distributed.fsdp import (
-    FullyShardedDataParallel as FSDP,
-    FullStateDictConfig,
-    MixedPrecision,
-    ShardingStrategy,
-    StateDictType,
-)
-from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
@@ -39,6 +32,7 @@ from transformers import AutoConfig
 from loss import approx_kl_divergence, build_loss
 from replay_buffer import Experience, ReplayBuffer, join_experience_batch
 from utils import load_config, load_model, sequences_log_probs, init_rng
+from weight_sync.train_backends import build_trainer_backend
 
 log = logging.getLogger(__name__)
 app = FastAPI()
@@ -59,9 +53,8 @@ def _gpu_peak_tflops(device: torch.device) -> float | None:
 # ── FSDP helper ──────────────────────────────────────────────────────
 
 def _wrap_fsdp(model):
-    # Use transformer_auto_wrap_policy based on the model's _no_split_modules.
-    # This wraps at decoder-layer boundaries and avoids FSDP sharding lm_head
-    # and embed_tokens into separate units (which causes size mismatches).
+    # Use the model's _no_split_modules to find decoder-layer classes and
+    # apply FSDP2 wrapping at those boundaries before wrapping the root module.
     layer_classes = set()
     if hasattr(model, "_no_split_modules"):
         for cls_name in model._no_split_modules:
@@ -70,23 +63,18 @@ def _wrap_fsdp(model):
                     layer_classes.add(type(module))
                     break
 
-    wrap_policy = functools.partial(
-        transformer_auto_wrap_policy,
-        transformer_layer_cls=layer_classes,
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        output_dtype=torch.bfloat16,
     )
-
-    return FSDP(
-        model,
-        auto_wrap_policy=wrap_policy,
-        mixed_precision=MixedPrecision(
-            param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
-            buffer_dtype=torch.bfloat16,
-        ),
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
-        device_id=torch.cuda.current_device(),
-        use_orig_params=True,
-    )
+    for module in model.modules():
+        if type(module) in layer_classes:
+            fully_shard(module, mp_policy=mp_policy)
+    fully_shard(model, mp_policy=mp_policy)
+    if not hasattr(model, "summon_full_params"):
+        raise RuntimeError("FSDP2 runtime missing summon_full_params")
+    return model, "fsdp2"
 
 
 # ── TrainServer ──────────────────────────────────────────────────────
@@ -100,8 +88,11 @@ class TrainServer:
         wcfg = scfg.get("weight_sync", {})
         self.rank = dist.get_rank()
         self.device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+        self.weight_sync_cfg = wcfg
+        self.max_nccl_params = int(wcfg.get("max_nccl_params", 70_000_000_000))
+        self.weight_sync_packed = bool(wcfg.get("packed", True))
 
-        # policy model (trainable, FSDP)
+        # policy model (trainable, FSDP2)
         model, self.tokenizer = load_model(
             mcfg["name"], trust_remote_code=mcfg["trust_remote_code"],
             bf16=mcfg["bf16"], device_map=None,
@@ -111,49 +102,61 @@ class TrainServer:
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False},
         )
-        self.model = _wrap_fsdp(model)
+        self.model, self.fsdp_impl = _wrap_fsdp(model)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(tcfg["lr"]))
         self.objective = build_loss(cfg["loss"])
 
-        # reference model (frozen, FSDP)
+        # reference model (frozen, FSDP2)
         ref, _ = load_model(
             mcfg["name"], trust_remote_code=mcfg["trust_remote_code"],
             bf16=mcfg["bf16"], device_map=None,
         )
         ref.to(self.device)
-        self.ref_model = _wrap_fsdp(ref)
+        self.ref_model, _ = _wrap_fsdp(ref)
         self.ref_model.eval()
 
         self.pad_id = self.tokenizer.eos_token_id
         self.replay = ReplayBuffer()
         self._sync_dir_ready = False
-        self._weight_sync_mode = "disk"
-        self._weight_sync_reason = "not_initialized"
-        self._weight_sync_group = None
-        self._weight_sync_backend = wcfg.get("backend", "nccl")
-        self._weight_sync_packed = bool(wcfg.get("packed", True))
-        self._max_nccl_params = int(wcfg.get("max_nccl_params", 70_000_000_000))
-        log.info("Rank %d ready on %s", self.rank, self.device)
+        self.weight_sync_mode = "disk"
+        self.weight_sync_reason = "not_initialized"
+        self.requested_weight_sync_backend = wcfg.get("backend", "nccl").lower()
+        self.backends = {
+            "disk": build_trainer_backend(self, "disk"),
+            "nccl": build_trainer_backend(self, "nccl"),
+            "rdma": build_trainer_backend(self, "rdma"),
+        }
+        self.active_weight_sync_backend = self.backends.get(
+            self.requested_weight_sync_backend, self.backends["disk"]
+        )
+        log.info(
+            "Rank %d ready on %s (wrap=%s, weight_sync=%s)",
+            self.rank,
+            self.device,
+            self.fsdp_impl,
+            self.requested_weight_sync_backend,
+        )
 
-    def _iter_model_named_parameters(self) -> Iterator[tuple[str, torch.Tensor]]:
+    def iter_model_named_parameters(self) -> Iterator[tuple[str, torch.Tensor]]:
         module = self.model.module if hasattr(self.model, "module") else self.model
         return module.named_parameters()
 
-    def _plan_weight_sync_mode(self) -> tuple[str, str]:
-        if self._weight_sync_backend != "nccl":
-            return "disk", f"backend={self._weight_sync_backend}"
-        if self.num_params > self._max_nccl_params:
-            return (
-                "disk",
-                f"num_params={self.num_params} exceeds max_nccl_params={self._max_nccl_params}",
-            )
-        try:
-            from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-        except Exception as exc:
-            return "disk", f"nccl_weight_transfer_unavailable: {exc}"
-        if NCCLWeightTransferEngine is None:
-            return "disk", "nccl_weight_transfer_unavailable"
-        return "nccl", "ok"
+    @contextmanager
+    def summon_full_params(self, rank0_only: bool = True):
+        with self.model.summon_full_params(  # type: ignore[attr-defined]
+            recurse=True,
+            writeback=False,
+            rank0_only=rank0_only,
+        ):
+            yield
+
+    def dist_barrier(self):
+        dist.barrier()
+
+    def broadcast_mode(self, mode: str, reason: str):
+        payload = [mode, reason]
+        dist.broadcast_object_list(payload, src=0)
+        self.weight_sync_mode, self.weight_sync_reason = payload
 
     # ── /create_online_dataset ───────────────────────────────────────
 
@@ -235,11 +238,13 @@ class TrainServer:
 
     # ── /save_weights ────────────────────────────────────────────────
 
-    def save_weights(self) -> dict:
-        """Gather full state-dict on rank 0 and write to shared directory."""
-        policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, policy):
-            sd = self.model.state_dict()
+    def save_weights_to_disk(self) -> dict:
+        """Gather full parameters on rank0 and write them to shared directory."""
+        sd: dict[str, torch.Tensor] = {}
+        with self.summon_full_params(rank0_only=True):
+            if self.rank == 0:
+                for name, param in self.iter_model_named_parameters():
+                    sd[name] = param.detach().cpu().contiguous()
 
         if self.rank == 0:
             sync_dir = Path(self.cfg.get("server", {}).get("weights_dir", ".vllm_weights"))
@@ -254,93 +259,44 @@ class TrainServer:
             save_file(sd, str(sync_dir / "model.safetensors"))
             log.info("Weights saved to %s", sync_dir)
 
-        dist.barrier()
-        return {"status": "ok"}
+        self.dist_barrier()
+        return {"status": "ok", "mode": "disk"}
+
+    def save_weights(self) -> dict:
+        return self.save_weights_to_disk()
 
     def plan_weight_sync(self) -> dict:
-        mode, reason = self._plan_weight_sync_mode()
-        self._weight_sync_mode = mode
-        self._weight_sync_reason = reason
-        return {
-            "status": "ok",
-            "mode": mode,
-            "reason": reason,
-            "num_params": self.num_params,
-            "max_nccl_params": self._max_nccl_params,
-        }
+        requested_backend = self.backends.get(
+            self.requested_weight_sync_backend, self.backends["disk"]
+        )
+        decision = requested_backend.plan()
+        self.active_weight_sync_backend = self.backends.get(decision.mode, self.backends["disk"])
+        self.weight_sync_mode = decision.mode
+        self.weight_sync_reason = decision.reason
+        payload = decision.asdict()
+        payload["status"] = "ok"
+        return payload
 
     def init_weight_sync(self, master_address: str, master_port: int, world_size: int) -> dict:
-        mode, reason = self._plan_weight_sync_mode()
-        if self.rank == 0 and mode == "nccl":
-            from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-
-            self._weight_sync_group = NCCLWeightTransferEngine.trainer_init(
-                dict(
-                    master_address=master_address,
-                    master_port=int(master_port),
-                    world_size=int(world_size),
-                )
-            )
-        elif self.rank == 0:
-            self._weight_sync_group = None
-
-        payload = [mode, reason]
-        dist.broadcast_object_list(payload, src=0)
-        self._weight_sync_mode, self._weight_sync_reason = payload
-        log.info(
-            "Weight sync mode on rank %d: %s (%s)",
-            self.rank,
-            self._weight_sync_mode,
-            self._weight_sync_reason,
+        result = self.active_weight_sync_backend.init(
+            master_address=master_address,
+            master_port=master_port,
+            world_size=world_size,
         )
-        return {"status": "ok", "mode": self._weight_sync_mode, "reason": self._weight_sync_reason}
+        if "mode" in result:
+            self.weight_sync_mode = result["mode"]
+        if "reason" in result:
+            self.weight_sync_reason = result["reason"]
+        return result
 
     def prepare_weight_sync(self) -> dict:
-        if self._weight_sync_mode != "nccl":
-            return {"status": "ok", "mode": "disk", "reason": self._weight_sync_reason}
-
-        names: list[str] = []
-        dtype_names: list[str] = []
-        shapes: list[list[int]] = []
-        with FSDP.summon_full_params(self.model, recurse=True, writeback=False, rank0_only=True):
-            if self.rank == 0:
-                for name, param in self._iter_model_named_parameters():
-                    names.append(name)
-                    dtype_names.append(str(param.dtype).replace("torch.", ""))
-                    shapes.append(list(param.shape))
-
-        dist.barrier()
-        if self.rank == 0:
-            return {
-                "status": "ok",
-                "mode": "nccl",
-                "names": names,
-                "dtype_names": dtype_names,
-                "shapes": shapes,
-                "packed": self._weight_sync_packed,
-            }
-        return {"status": "ok", "mode": "nccl"}
+        return self.active_weight_sync_backend.prepare()
 
     def broadcast_weights(self, packed: bool | None = None) -> dict:
-        if self._weight_sync_mode != "nccl":
-            return {"status": "ok", "mode": "disk", "reason": self._weight_sync_reason}
+        return self.active_weight_sync_backend.transfer(packed=packed)
 
-        if self._weight_sync_group is None:
-            raise RuntimeError("weight sync group is not initialized")
-
-        packed = self._weight_sync_packed if packed is None else bool(packed)
-        with FSDP.summon_full_params(self.model, recurse=True, writeback=False, rank0_only=True):
-            if self.rank == 0:
-                from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
-
-                NCCLWeightTransferEngine.trainer_send_weights(
-                    iterator=self._iter_model_named_parameters(),
-                    group=self._weight_sync_group,
-                    packed=packed,
-                )
-
-        dist.barrier()
-        return {"status": "ok", "mode": "nccl", "packed": packed}
+    def transfer_weights(self, ops: list[dict], packed: bool | None = None) -> dict:
+        return self.active_weight_sync_backend.transfer(ops=ops, packed=packed)
 
 
 # ── FastAPI endpoints ────────────────────────────────────────────────
@@ -391,6 +347,15 @@ async def ep_broadcast_weights(request: Request):
     except Exception:
         data = {}
     return server.broadcast_weights(packed=data.get("packed"))
+
+
+@app.post("/transfer_weights")
+async def ep_transfer_weights(request: Request):
+    data = await request.json()
+    return server.transfer_weights(
+        ops=data.get("ops", []),
+        packed=data.get("packed"),
+    )
 
 
 @app.get("/health")

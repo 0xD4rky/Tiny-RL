@@ -85,3 +85,9 @@ class TrainEngine:
 
     async def broadcast_weights(self, packed: bool) -> list[dict]:
         return await self._post_all("/broadcast_weights", json={"packed": packed})
+
+    async def transfer_weights(self, ops: list[dict], packed: bool = True) -> list[dict]:
+        return await self._post_all(
+            "/transfer_weights",
+            json={"ops": ops, "packed": packed},
+        )

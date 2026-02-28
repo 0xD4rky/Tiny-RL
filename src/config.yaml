@@ -14,6 +14,8 @@ gpu_split:
 server:
   train_url: http://localhost       # base URL for train servers
   train_port: 5000                  # rank i serves on train_port + i
+  rollout_url: http://localhost
+  rollout_port: 7000
   weights_dir: /dev/shm/vllm_weights  # RAM filesystem — eliminates disk I/O on weight sync
   weight_sync:
     backend: nccl
@@ -21,6 +23,12 @@ server:
     master_port: 6000
     packed: true
     max_nccl_params: 70000000000    # fallback to disk sync for larger models
+    transport: mock                 # mock|ibverbs|libfabric|auto|rdma(alias of auto)
+    num_nodes: 1                    # rdma backend falls back to NCCL when <=1
+    force_disk_fallback: true       # keep correctness until real RDMA writes are wired
+    transport_init:
+      device_index: 0               # ibverbs: NIC index
+      provider: ""                  # libfabric: e.g. verbs;ofi_rxm
 
 
 training:
