@@ -61,3 +61,27 @@ class TrainEngine:
 
     async def save_weights(self) -> list[dict]:
         return await self._post_all("/save_weights")
+
+    async def plan_weight_sync(self) -> list[dict]:
+        return await self._post_all("/plan_weight_sync")
+
+    async def init_weight_sync(
+        self,
+        master_address: str,
+        master_port: int,
+        world_size: int,
+    ) -> list[dict]:
+        return await self._post_all(
+            "/init_weight_sync",
+            json={
+                "master_address": master_address,
+                "master_port": master_port,
+                "world_size": world_size,
+            },
+        )
+
+    async def prepare_weight_sync(self) -> list[dict]:
+        return await self._post_all("/prepare_weight_sync", json={})
+
+    async def broadcast_weights(self, packed: bool) -> list[dict]:
+        return await self._post_all("/broadcast_weights", json={"packed": packed})

@@ -15,6 +15,12 @@ server:
   train_url: http://localhost       # base URL for train servers
   train_port: 5000                  # rank i serves on train_port + i
   weights_dir: /dev/shm/vllm_weights  # RAM filesystem — eliminates disk I/O on weight sync
+  weight_sync:
+    backend: nccl
+    master_address: 127.0.0.1
+    master_port: 6000
+    packed: true
+    max_nccl_params: 70000000000    # fallback to disk sync for larger models
 
 
 training:

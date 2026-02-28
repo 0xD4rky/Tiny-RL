@@ -8,7 +8,7 @@ compose-rl controller pattern:
         1. generate rollouts  (vLLM, local)
         2. send data to train servers  (/create_online_dataset)
         3. trigger training  (/train_1_iter)
-        4. sync weights  (/save_weights + vLLM reload)
+        4. sync weights  (NCCL in-memory, with disk fallback)
 
 Usage (preferred — single command):
     python launch.py --config config.yaml
@@ -77,6 +77,87 @@ async def run(cfg: dict):
     checkpoint_dir = Path(tcfg["checkpoint_path"]) / run_name
     sync_interval = rcfg.get("sync_interval", 2)
     weights_dir = scfg.get("weights_dir", ".vllm_weights")
+    wsync_cfg = scfg.get("weight_sync", {})
+    sync_mode = "disk"
+    sync_reason = "not_initialized"
+    weight_update_info: dict | None = None
+    weight_sync_packed = bool(wsync_cfg.get("packed", True))
+
+    async def _reload_engine_from_disk():
+        nonlocal engine
+        await train_engine.save_weights()
+        destroy_vllm_engine(engine)
+        engine = create_vllm_engine(
+            weights_dir,
+            rcfg["gpu_memory_utilization"],
+            rcfg["max_length"],
+            tensor_parallel_size=n_inference_gpus,
+        )
+
+    # ── initialize weight sync path ───────────────────────────────────
+    plan_results = await train_engine.plan_weight_sync()
+    plan = plan_results[0]
+    sync_mode = plan.get("mode", "disk")
+    sync_reason = plan.get("reason", "unknown")
+    if sync_mode == "nccl":
+        if not hasattr(engine, "init_weight_transfer_engine") or not hasattr(engine, "update_weights"):
+            sync_mode = "disk"
+            sync_reason = "vllm_api_missing_weight_transfer"
+            log.warning("Weight sync fallback to disk: %s", sync_reason)
+        else:
+            master_address = wsync_cfg.get("master_address", "127.0.0.1")
+            master_port = int(wsync_cfg.get("master_port", scfg.get("train_port", 5000) + 1000))
+            world_size = n_inference_gpus + 1  # trainer rank0 + all inference TP ranks
+            init_info = {
+                "master_address": master_address,
+                "master_port": master_port,
+                "world_size": world_size,
+                "rank_offset": 1,
+            }
+
+            def _init_vllm_weight_transfer():
+                try:
+                    engine.init_weight_transfer_engine({"init_info": init_info})
+                except TypeError:
+                    engine.init_weight_transfer_engine(init_info=init_info)
+
+            try:
+                _, init_results = await asyncio.gather(
+                    asyncio.to_thread(_init_vllm_weight_transfer),
+                    train_engine.init_weight_sync(master_address, master_port, world_size),
+                )
+                init_mode = init_results[0].get("mode", "disk")
+                if init_mode != "nccl":
+                    sync_mode = "disk"
+                    sync_reason = init_results[0].get("reason", "trainer_init_returned_disk")
+                else:
+                    prep_results = await train_engine.prepare_weight_sync()
+                    prep = prep_results[0]
+                    if prep.get("mode") != "nccl":
+                        sync_mode = "disk"
+                        sync_reason = prep.get("reason", "prepare_weight_sync_returned_disk")
+                    else:
+                        weight_sync_packed = bool(prep.get("packed", weight_sync_packed))
+                        weight_update_info = {
+                            "update_info": {
+                                "names": prep["names"],
+                                "dtype_names": prep["dtype_names"],
+                                "shapes": prep["shapes"],
+                                "packed": weight_sync_packed,
+                            }
+                        }
+
+                        def _update_vllm_weights():
+                            try:
+                                engine.update_weights(weight_update_info)
+                            except TypeError:
+                                engine.update_weights(update_info=weight_update_info["update_info"])
+            except Exception as exc:
+                sync_mode = "disk"
+                sync_reason = f"nccl_init_failed: {exc}"
+                log.warning("Weight sync fallback to disk: %s", sync_reason)
+
+    log.info("Weight sync mode: %s (%s)", sync_mode, sync_reason)
 
     log.info("%d prompts, %d steps, group_size=%d",
              len(prompts), len(loader), rcfg["group_size"])
@@ -138,17 +219,28 @@ async def run(cfg: dict):
                 "train/mfu": metrics.get("mfu"),
             }, step=k)
 
-        # 4) sync weights → reload vLLM
+        # 4) sync weights
         if (k + 1) % sync_interval == 0:
             t_sync = time.perf_counter()
-            await train_engine.save_weights()
-            destroy_vllm_engine(engine)
-            engine = create_vllm_engine(
-                weights_dir, rcfg["gpu_memory_utilization"], rcfg["max_length"],
-                tensor_parallel_size=n_inference_gpus,
-            )
-            sync_time = time.perf_counter() - t_sync
-            log.info("vLLM reloaded from %s (%.1fs)", weights_dir, sync_time)
+            if sync_mode == "nccl" and weight_update_info is not None:
+                try:
+                    await asyncio.gather(
+                        asyncio.to_thread(_update_vllm_weights),
+                        train_engine.broadcast_weights(packed=weight_sync_packed),
+                    )
+                    sync_time = time.perf_counter() - t_sync
+                    log.info("vLLM updated from trainer via NCCL (%.1fs)", sync_time)
+                except Exception as exc:
+                    sync_mode = "disk"
+                    sync_reason = f"nccl_sync_failed: {exc}"
+                    log.warning("Switching to disk weight sync: %s", sync_reason)
+                    await _reload_engine_from_disk()
+                    sync_time = time.perf_counter() - t_sync
+                    log.info("vLLM reloaded from %s (%.1fs)", weights_dir, sync_time)
+            else:
+                await _reload_engine_from_disk()
+                sync_time = time.perf_counter() - t_sync
+                log.info("vLLM reloaded from %s (%.1fs)", weights_dir, sync_time)
             wandb.log({"sync/weight_sync_time": sync_time}, step=k)
 
         # 5) checkpoint

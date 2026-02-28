@@ -17,6 +17,7 @@ import logging
 import os
 from pathlib import Path
 import time
+from typing import Iterator
 
 import torch
 import torch.distributed as dist
@@ -95,6 +96,8 @@ class TrainServer:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         mcfg, tcfg = cfg["model"], cfg["training"]
+        scfg = cfg.get("server", {})
+        wcfg = scfg.get("weight_sync", {})
         self.rank = dist.get_rank()
         self.device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 
@@ -124,7 +127,33 @@ class TrainServer:
         self.pad_id = self.tokenizer.eos_token_id
         self.replay = ReplayBuffer()
         self._sync_dir_ready = False
+        self._weight_sync_mode = "disk"
+        self._weight_sync_reason = "not_initialized"
+        self._weight_sync_group = None
+        self._weight_sync_backend = wcfg.get("backend", "nccl")
+        self._weight_sync_packed = bool(wcfg.get("packed", True))
+        self._max_nccl_params = int(wcfg.get("max_nccl_params", 70_000_000_000))
         log.info("Rank %d ready on %s", self.rank, self.device)
+
+    def _iter_model_named_parameters(self) -> Iterator[tuple[str, torch.Tensor]]:
+        module = self.model.module if hasattr(self.model, "module") else self.model
+        return module.named_parameters()
+
+    def _plan_weight_sync_mode(self) -> tuple[str, str]:
+        if self._weight_sync_backend != "nccl":
+            return "disk", f"backend={self._weight_sync_backend}"
+        if self.num_params > self._max_nccl_params:
+            return (
+                "disk",
+                f"num_params={self.num_params} exceeds max_nccl_params={self._max_nccl_params}",
+            )
+        try:
+            from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+        except Exception as exc:
+            return "disk", f"nccl_weight_transfer_unavailable: {exc}"
+        if NCCLWeightTransferEngine is None:
+            return "disk", "nccl_weight_transfer_unavailable"
+        return "nccl", "ok"
 
     # ── /create_online_dataset ───────────────────────────────────────
 
@@ -228,6 +257,91 @@ class TrainServer:
         dist.barrier()
         return {"status": "ok"}
 
+    def plan_weight_sync(self) -> dict:
+        mode, reason = self._plan_weight_sync_mode()
+        self._weight_sync_mode = mode
+        self._weight_sync_reason = reason
+        return {
+            "status": "ok",
+            "mode": mode,
+            "reason": reason,
+            "num_params": self.num_params,
+            "max_nccl_params": self._max_nccl_params,
+        }
+
+    def init_weight_sync(self, master_address: str, master_port: int, world_size: int) -> dict:
+        mode, reason = self._plan_weight_sync_mode()
+        if self.rank == 0 and mode == "nccl":
+            from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+            self._weight_sync_group = NCCLWeightTransferEngine.trainer_init(
+                dict(
+                    master_address=master_address,
+                    master_port=int(master_port),
+                    world_size=int(world_size),
+                )
+            )
+        elif self.rank == 0:
+            self._weight_sync_group = None
+
+        payload = [mode, reason]
+        dist.broadcast_object_list(payload, src=0)
+        self._weight_sync_mode, self._weight_sync_reason = payload
+        log.info(
+            "Weight sync mode on rank %d: %s (%s)",
+            self.rank,
+            self._weight_sync_mode,
+            self._weight_sync_reason,
+        )
+        return {"status": "ok", "mode": self._weight_sync_mode, "reason": self._weight_sync_reason}
+
+    def prepare_weight_sync(self) -> dict:
+        if self._weight_sync_mode != "nccl":
+            return {"status": "ok", "mode": "disk", "reason": self._weight_sync_reason}
+
+        names: list[str] = []
+        dtype_names: list[str] = []
+        shapes: list[list[int]] = []
+        with FSDP.summon_full_params(self.model, recurse=True, writeback=False, rank0_only=True):
+            if self.rank == 0:
+                for name, param in self._iter_model_named_parameters():
+                    names.append(name)
+                    dtype_names.append(str(param.dtype).replace("torch.", ""))
+                    shapes.append(list(param.shape))
+
+        dist.barrier()
+        if self.rank == 0:
+            return {
+                "status": "ok",
+                "mode": "nccl",
+                "names": names,
+                "dtype_names": dtype_names,
+                "shapes": shapes,
+                "packed": self._weight_sync_packed,
+            }
+        return {"status": "ok", "mode": "nccl"}
+
+    def broadcast_weights(self, packed: bool | None = None) -> dict:
+        if self._weight_sync_mode != "nccl":
+            return {"status": "ok", "mode": "disk", "reason": self._weight_sync_reason}
+
+        if self._weight_sync_group is None:
+            raise RuntimeError("weight sync group is not initialized")
+
+        packed = self._weight_sync_packed if packed is None else bool(packed)
+        with FSDP.summon_full_params(self.model, recurse=True, writeback=False, rank0_only=True):
+            if self.rank == 0:
+                from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+
+                NCCLWeightTransferEngine.trainer_send_weights(
+                    iterator=self._iter_model_named_parameters(),
+                    group=self._weight_sync_group,
+                    packed=packed,
+                )
+
+        dist.barrier()
+        return {"status": "ok", "mode": "nccl", "packed": packed}
+
 
 # ── FastAPI endpoints ────────────────────────────────────────────────
 
@@ -248,6 +362,35 @@ async def ep_train():
 @app.post("/save_weights")
 async def ep_save_weights():
     return server.save_weights()
+
+
+@app.post("/plan_weight_sync")
+async def ep_plan_weight_sync():
+    return server.plan_weight_sync()
+
+
+@app.post("/init_weight_sync")
+async def ep_init_weight_sync(request: Request):
+    data = await request.json()
+    return server.init_weight_sync(
+        master_address=data["master_address"],
+        master_port=int(data["master_port"]),
+        world_size=int(data["world_size"]),
+    )
+
+
+@app.post("/prepare_weight_sync")
+async def ep_prepare_weight_sync():
+    return server.prepare_weight_sync()
+
+
+@app.post("/broadcast_weights")
+async def ep_broadcast_weights(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    return server.broadcast_weights(packed=data.get("packed"))
 
 
 @app.get("/health")
