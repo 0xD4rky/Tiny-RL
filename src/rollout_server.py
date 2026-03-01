@@ -100,11 +100,13 @@ class RolloutServer:
             bf16=self.mcfg["bf16"],
             device_map="cpu",
         )
+        weight_backend = self.wcfg.get("backend", "disk")
         self.engine = create_vllm_engine(
             self.mcfg["name"],
             self.rcfg["gpu_memory_utilization"],
             self.rcfg["max_length"],
             tensor_parallel_size=self.num_infer_gpus,
+            weight_transfer_backend="nccl" if weight_backend == "nccl" else "",
         )
         self.pad_id = self.tokenizer.eos_token_id
 
@@ -153,11 +155,10 @@ class RolloutServer:
 
     def init_weight_sync(self, mode: str, init_info: dict[str, Any]) -> dict[str, Any]:
         if mode == "nccl":
-            llm_engine = getattr(self.engine, "llm_engine", self.engine)
             try:
-                llm_engine.init_weight_transfer_engine({"init_info": init_info})
+                self.engine.init_weight_transfer_engine({"init_info": init_info})
             except TypeError:
-                llm_engine.init_weight_transfer_engine(init_info=init_info)
+                self.engine.init_weight_transfer_engine(init_info=init_info)
             return {"status": "ok", "mode": "nccl"}
 
         if mode == "rdma":
@@ -178,11 +179,10 @@ class RolloutServer:
         return {"status": "ok", "mode": "disk"}
 
     def update_weights_nccl(self, update_info: dict[str, Any]) -> dict[str, Any]:
-        llm_engine = getattr(self.engine, "llm_engine", self.engine)
         try:
-            llm_engine.update_weights({"update_info": update_info})
+            self.engine.update_weights({"update_info": update_info})
         except TypeError:
-            llm_engine.update_weights(update_info=update_info)
+            self.engine.update_weights(update_info=update_info)
         return {"status": "ok", "mode": "nccl"}
 
     def reload_from_disk(self, model_path: str) -> dict[str, Any]:

@@ -87,10 +87,11 @@ def create_vllm_engine(
     gpu_memory_utilization: float = 0.3,
     max_model_len: int = 2048,
     tensor_parallel_size: int = 1,
+    weight_transfer_backend: str = "",
 ) -> "LLM":
     from vllm import LLM
 
-    return LLM(
+    kwargs: dict = dict(
         model=model_path,
         dtype="bfloat16",
         gpu_memory_utilization=gpu_memory_utilization,
@@ -98,6 +99,10 @@ def create_vllm_engine(
         tensor_parallel_size=tensor_parallel_size,
         enforce_eager=True,
     )
+    if weight_transfer_backend:
+        from vllm.config import WeightTransferConfig
+        kwargs["weight_transfer_config"] = WeightTransferConfig(backend=weight_transfer_backend)
+    return LLM(**kwargs)
 
 
 def destroy_vllm_engine(engine: "LLM"):
