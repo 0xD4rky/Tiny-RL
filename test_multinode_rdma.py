@@ -39,6 +39,7 @@ r = t.init_endpoint(
     peer_host=master,
     peer_port=port,
     provider=os.getenv("LIBFABRIC_PROVIDER", ""),
+    tcp_timeout_s=300,
 )
 assert r.get("status") == "ok", f"init failed: {r}"
 print(f"RDMA init ok: role={role} transport={r.get('transport')} provider={r.get('provider', '')}")
