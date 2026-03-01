@@ -15,6 +15,7 @@ def approx_kl_divergence(
     if action_mask is not None:
         log_ratio = log_ratio * action_mask
 
+    log_ratio.clamp_(min=-20.0, max=20.0)
     return log_ratio.exp() - log_ratio - 1
 
 def masked_mean(
@@ -36,7 +37,7 @@ class GRPOLoss(nn.Module):
         super().__init__()
         self.clip_eps = clip_eps
         self.kl_beta = kl_beta
-    
+
     def forward(
         self,
         log_probs: torch.Tensor,
@@ -54,7 +55,7 @@ class GRPOLoss(nn.Module):
             action_mask=action_mask,
         )
 
-        ratio = (log_probs - old_log_probs).exp() 
+        ratio = (log_probs - old_log_probs).exp()
         clipped_ratio = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps)
 
         loss = -torch.min(ratio * advantages, clipped_ratio * advantages) + self.kl_beta * kl
