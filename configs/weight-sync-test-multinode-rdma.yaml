@@ -9,15 +9,15 @@ compute:
   gpus: 16
   cluster: r5z2p1
 env_variables:
-  RDMA_BACKEND: libfabric
+  RDMA_BACKEND: "ibverbs"
   RDMA_PORT: "6000"
   RDMA_CTRL_PORT: "6001"
-  LIBFABRIC_PROVIDER: ""
 command: |-
   set -euo pipefail
   if [ -z "${MASTER_ADDR:-}" ]; then echo "MASTER_ADDR is required"; exit 1; fi
   apt-get update
-  apt-get install -y --no-install-recommends libfabric1 libfabric-dev
+  apt-get install -y --no-install-recommends rdma-core libibverbs1 libibverbs-dev
+  python -c 'import ctypes.util; print("libfabric:", ctypes.util.find_library("fabric")); print("libibverbs:", ctypes.util.find_library("ibverbs"))'
   git clone -b xiaohan/rdma-weight-sync https://github.com/XiaohanZhangCMU/Tiny-RL.git
   cd Tiny-RL
   pip install uv

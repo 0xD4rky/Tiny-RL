@@ -72,8 +72,6 @@ def _wrap_fsdp(model):
         if type(module) in layer_classes:
             fully_shard(module, mp_policy=mp_policy)
     fully_shard(model, mp_policy=mp_policy)
-    if not hasattr(model, "summon_full_params"):
-        raise RuntimeError("FSDP2 runtime missing summon_full_params")
     return model, "fsdp2"
 
 
@@ -147,12 +145,18 @@ class TrainServer:
 
     @contextmanager
     def summon_full_params(self, rank0_only: bool = True):
-        with self.model.summon_full_params(  # type: ignore[attr-defined]
-            recurse=True,
-            writeback=False,
-            rank0_only=rank0_only,
-        ):
+        """FSDP2: temporarily swap DTensor params with full (all-gathered) tensors."""
+        from torch.distributed._tensor import DTensor
+        swapped: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
+        try:
+            for param in self.model.parameters():
+                if isinstance(param.data, DTensor):
+                    swapped.append((param, param.data))
+                    param.data = param.data.full_tensor()
             yield
+        finally:
+            for param, orig in swapped:
+                param.data = orig
 
     def dist_barrier(self):
         dist.barrier()
