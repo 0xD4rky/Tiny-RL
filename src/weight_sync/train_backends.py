@@ -125,18 +125,12 @@ class NcclTrainerBackend:
         # Only rank 0 has the NCCL group and does the broadcast.
         with self.server.summon_full_params(rank0_only=True) as full_params:
             if self.server.rank == 0 and self._group is not None:
-                from vllm.distributed.weight_transfer.nccl_engine import (
-                    NCCLTrainerSendWeightsArgs,
-                    NCCLWeightTransferEngine,
-                )
+                from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
-                trainer_args = NCCLTrainerSendWeightsArgs(
-                    group=self._group,
-                    packed=packed,
-                )
                 NCCLWeightTransferEngine.trainer_send_weights(
                     iterator=full_params.items(),
-                    trainer_args=trainer_args,
+                    group=self._group,
+                    packed=packed,
                 )
 
         self.server.dist_barrier()

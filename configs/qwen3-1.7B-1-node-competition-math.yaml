@@ -80,7 +80,7 @@ parameters:
     top_p: 1.0
     temperature: 1.0
     gpu_memory_utilization: 0.3
-    sync_interval: 2
+    sync_interval: 1
   
   wandb:
     project: RL
