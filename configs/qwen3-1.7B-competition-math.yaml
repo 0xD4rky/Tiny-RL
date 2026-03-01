@@ -40,8 +40,8 @@ parameters:
     max_rows: null
   
   gpu_split:
-    train: [0, 1, 2, 3, 4, 5, 6, 7]      # all 8 GPUs on train node (node 0)
-    inference: [0, 1, 2, 3, 4, 5, 6, 7]  # all 8 GPUs on inference node (node 1)
+    train: [0, 1, 2, 3, 4, 5, 6, 7]          # node 0: global GPUs 0-7
+    inference: [8, 9, 10, 11, 12, 13, 14, 15] # node 1: global GPUs 8-15
 
   server:
     train_url: "http://__MASTER_ADDR__"   # resolved at runtime → node 0

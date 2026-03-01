@@ -388,6 +388,18 @@ if __name__ == "__main__":
     init_rng(cfg["training"]["seed"])
     server = TrainServer(cfg)
 
+    # Rank 0: start wandb for system GPU monitoring (grouped with controller run)
+    if dist.get_rank() == 0:
+        import wandb
+        run_name = cfg.get("wandb", {}).get("run_name", "run")
+        wandb.init(
+            project=cfg.get("wandb", {}).get("project", "RL"),
+            name=f"{run_name}-train",
+            group=run_name,
+            job_type="train",
+            config=cfg,
+        )
+
     port = args.port + int(os.environ["LOCAL_RANK"])
     log.info("Train server rank %d on port %d", dist.get_rank(), port)
     uvicorn.run(app, host="0.0.0.0", port=port)

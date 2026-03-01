@@ -63,7 +63,13 @@ async def run(cfg: dict):
                         shuffle=True, drop_last=True)
 
     run_name = cfg["wandb"]["run_name"]
-    wandb.init(project=cfg["wandb"]["project"], name=run_name, config=cfg)
+    wandb.init(
+        project=cfg["wandb"]["project"],
+        name=f"{run_name}-rollout",
+        group=run_name,
+        job_type="rollout",
+        config=cfg,
+    )
     checkpoint_dir = Path(tcfg["checkpoint_path"]) / run_name
     sync_interval = rcfg.get("sync_interval", 2)
     weights_dir = scfg.get("weights_dir", ".vllm_weights")
