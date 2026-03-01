@@ -172,6 +172,7 @@ class RolloutServer:
             else:
                 merged.setdefault("listen_host", "0.0.0.0")
                 merged.setdefault("listen_port", master_port)
+            merged.setdefault("tcp_timeout_s", 300)
             return self.transport.init_endpoint(**merged)
 
         return {"status": "ok", "mode": "disk"}
