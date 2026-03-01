@@ -252,7 +252,10 @@ class TrainServer:
         with self.summon_full_params(rank0_only=True):
             if self.rank == 0:
                 for name, param in self.iter_model_named_parameters():
-                    sd[name] = param.data.cpu().clone()
+                    t = param.data
+                    cpu_t = torch.empty(t.shape, dtype=t.dtype, device="cpu")
+                    cpu_t.copy_(t)
+                    sd[name] = cpu_t
 
         if self.rank == 0:
             sync_dir = Path(self.cfg.get("server", {}).get("weights_dir", ".vllm_weights"))
