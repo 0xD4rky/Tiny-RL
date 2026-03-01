@@ -356,9 +356,22 @@ class IbverbsTransport(WeightTransferTransport):
                     peer = _json_recv(conn)
                     _json_send(conn, payload)
                     return peer
-        with socket.create_connection((host, port), timeout=timeout_s) as conn:
-            _json_send(conn, payload)
-            return _json_recv(conn)
+        # Retry with backoff — the server node may not be listening yet.
+        deadline = time.monotonic() + timeout_s
+        delay = 0.5
+        while True:
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("timed out waiting for server")
+                with socket.create_connection((host, port), timeout=min(delay, remaining)) as conn:
+                    _json_send(conn, payload)
+                    return _json_recv(conn)
+            except (ConnectionRefusedError, OSError):
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 5.0)
 
     def _setup_qp(self):
         self._cq = self._lib.ibv_create_cq(self._ctx, 4096, None, None, 0)
