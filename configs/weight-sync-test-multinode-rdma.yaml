@@ -1,4 +1,4 @@
-name: tinyrl-weight-sync-test-minimal
+name: tinyrl-weight-sync-test-multinode-rdma
 image: mosaicml/dle:nightly-latest
 scheduling:
   priority: low
@@ -6,12 +6,17 @@ scheduling:
   preemptible: true
   max_duration: 1
 compute:
-  gpus: 8
+  gpus: 16
   cluster: r5z2p1
+env_variables:
+  RDMA_BACKEND: rdma
+  RDMA_PORT: "6000"
+  RDMA_CTRL_PORT: "6001"
 command: |-
   set -euo pipefail
+  if [ -z "${MASTER_ADDR:-}" ]; then echo "MASTER_ADDR is required"; exit 1; fi
   git clone -b xiaohan/rdma-weight-sync https://github.com/XiaohanZhangCMU/Tiny-RL.git
   cd Tiny-RL
   pip install uv
   uv sync
-  uv run python test.py
+  uv run python test_multinode_rdma.py
