@@ -26,15 +26,6 @@ log = logging.getLogger(__name__)
 app = FastAPI()
 
 
-def _safe_collective_rpc(engine, method_name: str):
-    if not hasattr(engine, "collective_rpc"):
-        return None
-    try:
-        return engine.collective_rpc(method_name)
-    except Exception:
-        return None
-
-
 def _resolve_engine_model(engine):
     candidates = [
         ["llm_engine", "model_executor", "driver_worker", "model_runner", "model"],
@@ -162,10 +153,11 @@ class RolloutServer:
 
     def init_weight_sync(self, mode: str, init_info: dict[str, Any]) -> dict[str, Any]:
         if mode == "nccl":
+            llm_engine = getattr(self.engine, "llm_engine", self.engine)
             try:
-                self.engine.init_weight_transfer_engine({"init_info": init_info})
+                llm_engine.init_weight_transfer_engine({"init_info": init_info})
             except TypeError:
-                self.engine.init_weight_transfer_engine(init_info=init_info)
+                llm_engine.init_weight_transfer_engine(init_info=init_info)
             return {"status": "ok", "mode": "nccl"}
 
         if mode == "rdma":
@@ -185,10 +177,11 @@ class RolloutServer:
         return {"status": "ok", "mode": "disk"}
 
     def update_weights_nccl(self, update_info: dict[str, Any]) -> dict[str, Any]:
+        llm_engine = getattr(self.engine, "llm_engine", self.engine)
         try:
-            self.engine.update_weights({"update_info": update_info})
+            llm_engine.update_weights({"update_info": update_info})
         except TypeError:
-            self.engine.update_weights(update_info=update_info)
+            llm_engine.update_weights(update_info=update_info)
         return {"status": "ok", "mode": "nccl"}
 
     def reload_from_disk(self, model_path: str) -> dict[str, Any]:
@@ -202,15 +195,11 @@ class RolloutServer:
         return {"status": "ok", "mode": "disk", "model_path": model_path}
 
     def get_param_metadata(self) -> dict[str, Any]:
-        data = _safe_collective_rpc(self.engine, "tinyrl_collect_param_metadata")
-        if data is None:
-            data = [{"rank": 0, "params": _collect_param_metadata_local(self.engine)}]
+        data = [{"rank": 0, "params": _collect_param_metadata_local(self.engine)}]
         return {"status": "ok", "workers": data}
 
     def get_memory_regions(self) -> dict[str, Any]:
-        data = _safe_collective_rpc(self.engine, "tinyrl_collect_memory_regions")
-        if data is None:
-            data = [{"rank": 0, "regions": _collect_memory_regions_local()}]
+        data = [{"rank": 0, "regions": _collect_memory_regions_local()}]
         return {"status": "ok", "workers": data}
 
     def register_mrs(self, regions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -228,47 +217,6 @@ class RolloutServer:
             "total_bytes": total_bytes,
             "ack_step": self.last_synced_step,
         }
-
-
-def _install_vllm_worker_hooks():
-    # Best-effort monkey patches for collective_rpc metadata calls.
-    try:
-        from vllm.worker.worker import Worker
-    except Exception:
-        return
-
-    if not hasattr(Worker, "tinyrl_collect_param_metadata"):
-        def tinyrl_collect_param_metadata(self):
-            model = getattr(getattr(self, "model_runner", None), "model", None)
-            if model is None:
-                return {"rank": -1, "params": []}
-            params = []
-            for name, p in model.named_parameters():
-                if not isinstance(p, torch.Tensor):
-                    continue
-                if not p.is_cuda:
-                    continue
-                params.append(
-                    {
-                        "name": name,
-                        "ptr": int(p.data_ptr()),
-                        "nbytes": int(p.numel() * p.element_size()),
-                        "dtype": str(p.dtype).replace("torch.", ""),
-                        "shape": list(p.shape),
-                    }
-                )
-            rank = int(getattr(self, "rank", -1))
-            return {"rank": rank, "params": params}
-
-        Worker.tinyrl_collect_param_metadata = tinyrl_collect_param_metadata
-
-    if not hasattr(Worker, "tinyrl_collect_memory_regions"):
-        def tinyrl_collect_memory_regions(self):
-            regions = _collect_memory_regions_local()
-            rank = int(getattr(self, "rank", -1))
-            return {"rank": rank, "regions": regions}
-
-        Worker.tinyrl_collect_memory_regions = tinyrl_collect_memory_regions
 
 
 server: RolloutServer | None = None
@@ -335,7 +283,6 @@ if __name__ == "__main__":
 
     cfg = load_config(args.config)
     init_rng(cfg["training"]["seed"])
-    _install_vllm_worker_hooks()
     server = RolloutServer(cfg)
 
     log.info("Rollout server listening on port %d", args.port)

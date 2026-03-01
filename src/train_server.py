@@ -252,7 +252,7 @@ class TrainServer:
         with self.summon_full_params(rank0_only=True):
             if self.rank == 0:
                 for name, param in self.iter_model_named_parameters():
-                    sd[name] = param.detach().cpu().contiguous()
+                    sd[name] = param.data.cpu().clone()
 
         if self.rank == 0:
             sync_dir = Path(self.cfg.get("server", {}).get("weights_dir", ".vllm_weights"))
