@@ -204,7 +204,7 @@ def sequences_log_probs(
         chunk_mask = attention_mask[i : i + chunk_size]
         position_ids = chunk_mask.long().cumsum(dim=-1) - 1
         position_ids.masked_fill_(mask=(chunk_mask == 0), value=1)
-        output = model.forward(
+        output = model(
             input_ids=chunk_ids,
             attention_mask=chunk_mask,
             position_ids=position_ids,
