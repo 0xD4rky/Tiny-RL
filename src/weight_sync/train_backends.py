@@ -209,8 +209,8 @@ class RdmaTrainerBackend:
             return {"status": "ok", "mode": self.server.weight_sync_mode, "reason": self.server.weight_sync_reason}
 
         routes: list[dict[str, Any]] = []
-        if self.server.rank == 0:
-            with self.server.summon_full_params(rank0_only=True):
+        with self.server.summon_full_params(rank0_only=True):
+            if self.server.rank == 0:
                 for name, param in self.server.iter_model_named_parameters():
                     routes.append(
                         {
@@ -236,11 +236,12 @@ class RdmaTrainerBackend:
         # Phase-2 mock: run transport transfer call for correctness flow.
         ops = kwargs.get("ops", [])
         res: dict[str, Any] = {"status": "ok", "mode": "rdma", "rank": self.server.rank}
-        if self.server.rank == 0:
-            param_ptrs: dict[str, int] = {}
-            with self.server.summon_full_params(rank0_only=True):
+        param_ptrs: dict[str, int] = {}
+        with self.server.summon_full_params(rank0_only=True):
+            if self.server.rank == 0:
                 for name, param in self.server.iter_model_named_parameters():
                     param_ptrs[name] = int(param.data_ptr())
+        if self.server.rank == 0:
 
             parsed_ops: list[TransferOp] = []
             for op in ops:
