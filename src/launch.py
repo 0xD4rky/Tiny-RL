@@ -44,7 +44,12 @@ def main():
 
     node_rank = int(os.environ.get("NODE_RANK", 0))
     master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
-    num_nodes = int(os.environ.get("NNODES", 1))
+    # MosaicML doesn't set NNODES; read from config, then env, then default.
+    num_nodes = int(
+        cfg.get("server", {}).get("weight_sync", {}).get(
+            "num_nodes", os.environ.get("NNODES", 1)
+        )
+    )
 
     # Resolve placeholders (e.g. __MASTER_ADDR__ → actual hostname)
     cfg = _resolve_config(cfg, master_addr)

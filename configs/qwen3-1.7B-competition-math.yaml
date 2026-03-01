@@ -18,6 +18,11 @@ command: |-
   apt-get update
   apt-get install -y --no-install-recommends rdma-core libibverbs1 libibverbs-dev
   python -c 'import ctypes.util; print("libfabric:", ctypes.util.find_library("fabric")); print("libibverbs:", ctypes.util.find_library("ibverbs"))'
+  for port in $(ss -tlnp 2>/dev/null | awk 'NR>1 {split($4,a,":"); print a[length(a)]}' | sort -un); do
+      if [ "$port" -ge 29500 ] 2>/dev/null && [ "$port" -le 65535 ]; then
+          fuser -k "$port"/tcp 2>/dev/null || true
+      fi
+  done
   git clone -b xiaohan/rdma-weight-sync https://github.com/XiaohanZhangCMU/Tiny-RL.git
   cd Tiny-RL
   pip install uv 
