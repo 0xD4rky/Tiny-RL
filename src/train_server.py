@@ -145,18 +145,21 @@ class TrainServer:
 
     @contextmanager
     def summon_full_params(self, rank0_only: bool = True):
-        """FSDP2: temporarily swap DTensor params with full (all-gathered) tensors."""
+        """FSDP2: all-gather sharded params, yield {name: plain_tensor} dict.
+
+        Yields a dict mapping parameter names to regular torch.Tensors
+        (not DTensors), safe for .cpu(), .data_ptr(), .copy_() etc.
+        """
         from torch.distributed._tensor import DTensor
-        swapped: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
-        try:
-            for param in self.model.parameters():
-                if isinstance(param.data, DTensor):
-                    swapped.append((param, param.data))
-                    param.data = param.data.full_tensor()
-            yield
-        finally:
-            for param, orig in swapped:
-                param.data = orig
+        full: dict[str, torch.Tensor] = {}
+        module = self.model.module if hasattr(self.model, "module") else self.model
+        for name, param in module.named_parameters():
+            data = param.data
+            if isinstance(data, DTensor):
+                full[name] = data.full_tensor()
+            else:
+                full[name] = data
+        yield full
 
     def dist_barrier(self):
         dist.barrier()
@@ -249,13 +252,10 @@ class TrainServer:
     def save_weights_to_disk(self) -> dict:
         """Gather full parameters on rank0 and write them to shared directory."""
         sd: dict[str, torch.Tensor] = {}
-        with self.summon_full_params(rank0_only=True):
+        with self.summon_full_params(rank0_only=True) as full_params:
             if self.rank == 0:
-                for name, param in self.iter_model_named_parameters():
-                    t = param.data
-                    cpu_t = torch.empty(t.shape, dtype=t.dtype, device="cpu")
-                    cpu_t.copy_(t)
-                    sd[name] = cpu_t
+                for name, t in full_params.items():
+                    sd[name] = t.cpu().clone()
 
         if self.rank == 0:
             sync_dir = Path(self.cfg.get("server", {}).get("weights_dir", ".vllm_weights"))

@@ -97,12 +97,12 @@ class NcclTrainerBackend:
         names: list[str] = []
         dtype_names: list[str] = []
         shapes: list[list[int]] = []
-        with self.server.summon_full_params(rank0_only=True):
+        with self.server.summon_full_params(rank0_only=True) as full_params:
             if self.server.rank == 0:
-                for name, param in self.server.iter_model_named_parameters():
+                for name, t in full_params.items():
                     names.append(name)
-                    dtype_names.append(str(param.dtype).replace("torch.", ""))
-                    shapes.append(list(param.shape))
+                    dtype_names.append(str(t.dtype).replace("torch.", ""))
+                    shapes.append(list(t.shape))
 
         self.server.dist_barrier()
         if self.server.rank == 0:
@@ -123,12 +123,12 @@ class NcclTrainerBackend:
             raise RuntimeError("NCCL trainer transfer group is not initialized")
 
         packed = bool(kwargs.get("packed", self.server.weight_sync_packed))
-        with self.server.summon_full_params(rank0_only=True):
+        with self.server.summon_full_params(rank0_only=True) as full_params:
             if self.server.rank == 0:
                 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
                 NCCLWeightTransferEngine.trainer_send_weights(
-                    iterator=self.server.iter_model_named_parameters(),
+                    iterator=full_params.items(),
                     group=self._group,
                     packed=packed,
                 )
@@ -209,18 +209,18 @@ class RdmaTrainerBackend:
             return {"status": "ok", "mode": self.server.weight_sync_mode, "reason": self.server.weight_sync_reason}
 
         routes: list[dict[str, Any]] = []
-        with self.server.summon_full_params(rank0_only=True):
+        with self.server.summon_full_params(rank0_only=True) as full_params:
             if self.server.rank == 0:
-                for name, param in self.server.iter_model_named_parameters():
+                for name, t in full_params.items():
                     routes.append(
                         {
                             "src_param": name,
                             "dst_param": name,
                             "src_off": 0,
                             "dst_off": 0,
-                            "shape": list(param.shape),
-                            "dtype": str(param.dtype).replace("torch.", ""),
-                            "nbytes": int(param.numel() * param.element_size()),
+                            "shape": list(t.shape),
+                            "dtype": str(t.dtype).replace("torch.", ""),
+                            "nbytes": int(t.numel() * t.element_size()),
                             "pack": False,
                         }
                     )
@@ -238,11 +238,11 @@ class RdmaTrainerBackend:
         # All ranks enter summon_full_params (collective all-gather).
         # Rank 0 builds transfer ops and executes the RDMA transfer while
         # the full tensors are still alive in GPU memory.
-        with self.server.summon_full_params(rank0_only=True):
+        with self.server.summon_full_params(rank0_only=True) as full_params:
             if self.server.rank == 0:
                 param_ptrs: dict[str, int] = {}
-                for name, param in self.server.iter_model_named_parameters():
-                    param_ptrs[name] = int(param.data_ptr())
+                for name, t in full_params.items():
+                    param_ptrs[name] = int(t.data_ptr())
 
                 parsed_ops: list[TransferOp] = []
                 for op in ops:

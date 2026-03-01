@@ -7,7 +7,7 @@ dependencies = [
     "transformers>=4.45",
     "hf_transfer",
     "datasets>=3.0",
-    "vllm>=0.6",
+    "vllm>=0.16",
     "wandb>=0.18",
     "pyyaml>=6.0",
     "accelerate>=1.12.0",
