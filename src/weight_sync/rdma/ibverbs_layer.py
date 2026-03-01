@@ -3,8 +3,11 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import json
+import os
 import random
 import socket
+import subprocess
+import tempfile
 import time
 from typing import Any
 
@@ -225,6 +228,41 @@ class _IbvQp(ctypes.Structure):
     ]
 
 
+_HELPERS_C = """\
+#include <infiniband/verbs.h>
+
+int wrap_ibv_post_send(struct ibv_qp *qp, struct ibv_send_wr *wr,
+                       struct ibv_send_wr **bad_wr) {
+    return ibv_post_send(qp, wr, bad_wr);
+}
+
+int wrap_ibv_poll_cq(struct ibv_cq *cq, int num_entries, struct ibv_wc *wc) {
+    return ibv_poll_cq(cq, num_entries, wc);
+}
+"""
+
+_helpers_so_path: str | None = None
+
+
+def _compile_helpers() -> str:
+    global _helpers_so_path
+    if _helpers_so_path and os.path.exists(_helpers_so_path):
+        return _helpers_so_path
+    so_path = os.path.join(tempfile.gettempdir(), "ibverbs_helpers.so")
+    if os.path.exists(so_path):
+        _helpers_so_path = so_path
+        return so_path
+    c_path = so_path.replace(".so", ".c")
+    with open(c_path, "w") as f:
+        f.write(_HELPERS_C)
+    subprocess.check_call(
+        ["gcc", "-shared", "-fPIC", "-O2", "-o", so_path, c_path, "-libverbs"],
+        timeout=30,
+    )
+    _helpers_so_path = so_path
+    return so_path
+
+
 def _json_send(sock: socket.socket, payload: dict[str, Any]):
     data = json.dumps(payload).encode() + b"\n"
     sock.sendall(data)
@@ -243,6 +281,7 @@ class IbverbsTransport(WeightTransferTransport):
 
     def __init__(self):
         self._lib = None
+        self._helpers = None
         self._ctx = ctypes.c_void_p()
         self._pd = ctypes.c_void_p()
         self._cq = ctypes.c_void_p()
@@ -293,10 +332,17 @@ class IbverbsTransport(WeightTransferTransport):
         self._lib.ibv_reg_mr.restype = ctypes.POINTER(_IbvMr)
         self._lib.ibv_dereg_mr.argtypes = [ctypes.POINTER(_IbvMr)]
         self._lib.ibv_dereg_mr.restype = ctypes.c_int
-        self._lib.ibv_post_send.argtypes = [ctypes.POINTER(_IbvQp), ctypes.POINTER(_IbvSendWr), ctypes.POINTER(ctypes.POINTER(_IbvSendWr))]
-        self._lib.ibv_post_send.restype = ctypes.c_int
-        self._lib.ibv_poll_cq.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(_IbvWc)]
-        self._lib.ibv_poll_cq.restype = ctypes.c_int
+
+        # ibv_post_send and ibv_poll_cq are inline functions in modern
+        # rdma-core (they dispatch through function-pointer tables on the
+        # QP/CQ structs).  They are NOT exported symbols in libibverbs.so,
+        # so we compile a tiny C wrapper that calls the real inlines.
+        helpers_path = _compile_helpers()
+        self._helpers = ctypes.CDLL(helpers_path)
+        self._helpers.wrap_ibv_post_send.argtypes = [ctypes.POINTER(_IbvQp), ctypes.POINTER(_IbvSendWr), ctypes.POINTER(ctypes.POINTER(_IbvSendWr))]
+        self._helpers.wrap_ibv_post_send.restype = ctypes.c_int
+        self._helpers.wrap_ibv_poll_cq.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(_IbvWc)]
+        self._helpers.wrap_ibv_poll_cq.restype = ctypes.c_int
 
     def _tcp_exchange(self, role: str, payload: dict[str, Any], host: str, port: int, timeout_s: float) -> dict[str, Any]:
         if role == "server":
@@ -611,7 +657,7 @@ class IbverbsTransport(WeightTransferTransport):
             wr.wr.rdma.rkey = ctypes.c_uint32(dst_rkey)
 
             bad_wr = ctypes.POINTER(_IbvSendWr)()
-            rc = self._lib.ibv_post_send(self._qp, ctypes.byref(wr), ctypes.byref(bad_wr))
+            rc = self._helpers.wrap_ibv_post_send(self._qp, ctypes.byref(wr), ctypes.byref(bad_wr))
             if rc != 0:
                 return {
                     "status": "error",
@@ -622,7 +668,7 @@ class IbverbsTransport(WeightTransferTransport):
             wc = _IbvWc()
             t0 = time.time()
             while True:
-                n = self._lib.ibv_poll_cq(self._cq, 1, ctypes.byref(wc))
+                n = self._helpers.wrap_ibv_poll_cq(self._cq, 1, ctypes.byref(wc))
                 if n < 0:
                     return {
                         "status": "error",
