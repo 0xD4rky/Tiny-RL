@@ -174,15 +174,15 @@ class RdmaTrainerBackend:
             return {"status": "ok", "mode": decision.mode, "reason": decision.reason}
         init_kwargs = dict(self.server.weight_sync_cfg.get("transport_init", {}))
         init_kwargs.update(kwargs)
-        init_kwargs.setdefault("role", "client")
+        init_kwargs.setdefault("role", "server")
         master_address = str(kwargs.get("master_address", init_kwargs.get("master_address", "127.0.0.1")))
         master_port = int(kwargs.get("master_port", init_kwargs.get("master_port", 6000)))
-        if init_kwargs["role"] == "client":
+        if init_kwargs["role"] == "server":
+            init_kwargs.setdefault("listen_host", "0.0.0.0")
+            init_kwargs.setdefault("listen_port", master_port)
+        else:
             init_kwargs.setdefault("peer_host", master_address)
             init_kwargs.setdefault("peer_port", master_port)
-        else:
-            init_kwargs.setdefault("listen_host", master_address)
-            init_kwargs.setdefault("listen_port", master_port)
         res = self.transport.init_endpoint(**init_kwargs)
         if res.get("status") != "ok":
             self.server.broadcast_mode("disk", f"rdma_init_failed: {res.get('reason', 'unknown')}")

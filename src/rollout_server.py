@@ -163,15 +163,15 @@ class RolloutServer:
         if mode == "rdma":
             merged = dict(self.wcfg.get("transport_init", {}))
             merged.update(init_info)
-            merged.setdefault("role", "server")
+            merged.setdefault("role", "client")
             master_address = str(init_info.get("master_address", merged.get("master_address", "0.0.0.0")))
             master_port = int(init_info.get("master_port", merged.get("master_port", 6000)))
-            if merged["role"] == "server":
-                merged.setdefault("listen_host", master_address)
-                merged.setdefault("listen_port", master_port)
-            else:
+            if merged["role"] == "client":
                 merged.setdefault("peer_host", master_address)
                 merged.setdefault("peer_port", master_port)
+            else:
+                merged.setdefault("listen_host", "0.0.0.0")
+                merged.setdefault("listen_port", master_port)
             return self.transport.init_endpoint(**merged)
 
         return {"status": "ok", "mode": "disk"}
