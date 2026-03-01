@@ -39,14 +39,14 @@ parameters:
     inference: [0, 1, 2, 3, 4, 5, 6, 7]  # all 8 GPUs on inference node (node 1)
 
   server:
-    train_url: __TRAIN_NODE_ADDR__    # resolved at runtime by launch.py → node 0 (MASTER_ADDR)
-    train_port: 5000                  # rank i serves on train_port + i
-    rollout_url: http://localhost     # controller runs on same node as rollout
+    train_url: "http://__MASTER_ADDR__"   # resolved at runtime → node 0
+    train_port: 5000                     # rank i serves on train_port + i
+    rollout_url: http://localhost         # controller runs on same node as rollout
     rollout_port: 7000
-    weights_dir: /dev/shm/vllm_weights  # RAM filesystem — eliminates disk I/O on weight sync
+    weights_dir: /dev/shm/vllm_weights
     weight_sync:
       backend: rdma
-      master_address: __TRAIN_NODE_ADDR__  # resolved at runtime → node 0 address
+      master_address: __MASTER_ADDR__    # resolved at runtime → node 0 hostname
       master_port: 6000
       packed: true
       max_nccl_params: 70000000000
