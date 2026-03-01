@@ -235,36 +235,38 @@ class RdmaTrainerBackend:
 
         ops = kwargs.get("ops", [])
         res: dict[str, Any] = {"status": "ok", "mode": "rdma", "rank": self.server.rank}
-        param_ptrs: dict[str, int] = {}
+        # All ranks enter summon_full_params (collective all-gather).
+        # Rank 0 builds transfer ops and executes the RDMA transfer while
+        # the full tensors are still alive in GPU memory.
         with self.server.summon_full_params(rank0_only=True):
             if self.server.rank == 0:
+                param_ptrs: dict[str, int] = {}
                 for name, param in self.server.iter_model_named_parameters():
                     param_ptrs[name] = int(param.data_ptr())
-        if self.server.rank == 0:
 
-            parsed_ops: list[TransferOp] = []
-            for op in ops:
-                if isinstance(op, TransferOp):
-                    p = op
-                else:
-                    src_param = str(op.get("src_param", ""))
-                    src_base = int(param_ptrs.get(src_param, 0))
-                    src_off = int(op.get("src_off", 0))
-                    p = TransferOp(
-                        src_param=src_param,
-                        dst_param=str(op.get("dst_param", src_param)),
-                        src_off=src_off,
-                        dst_off=int(op.get("dst_off", 0)),
-                        nbytes=int(op.get("nbytes", 0)),
-                        pack=bool(op.get("pack", False)),
-                        src_ptr=int(op.get("src_ptr", src_base + src_off if src_base else 0)),
-                        dst_ptr=int(op.get("dst_ptr", 0)),
-                        dst_rkey=int(op.get("dst_rkey", 0)),
-                    )
-                if p.nbytes > 0 and p.src_ptr > 0 and p.dst_ptr > 0 and p.dst_rkey > 0:
-                    parsed_ops.append(p)
+                parsed_ops: list[TransferOp] = []
+                for op in ops:
+                    if isinstance(op, TransferOp):
+                        p = op
+                    else:
+                        src_param = str(op.get("src_param", ""))
+                        src_base = int(param_ptrs.get(src_param, 0))
+                        src_off = int(op.get("src_off", 0))
+                        p = TransferOp(
+                            src_param=src_param,
+                            dst_param=str(op.get("dst_param", src_param)),
+                            src_off=src_off,
+                            dst_off=int(op.get("dst_off", 0)),
+                            nbytes=int(op.get("nbytes", 0)),
+                            pack=bool(op.get("pack", False)),
+                            src_ptr=int(op.get("src_ptr", src_base + src_off if src_base else 0)),
+                            dst_ptr=int(op.get("dst_ptr", 0)),
+                            dst_rkey=int(op.get("dst_rkey", 0)),
+                        )
+                    if p.nbytes > 0 and p.src_ptr > 0 and p.dst_ptr > 0 and p.dst_rkey > 0:
+                        parsed_ops.append(p)
 
-            res = self.transport.transfer(parsed_ops)
+                res = self.transport.transfer(parsed_ops)
         self.server.dist_barrier()
         if res.get("status") != "ok":
             disk_res = self.server.save_weights_to_disk()

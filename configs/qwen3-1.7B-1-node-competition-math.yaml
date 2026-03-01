@@ -11,7 +11,6 @@ compute:
 env_variables:
   WANDB_API_KEY: 06d47912179062d79bdbe20e333a8a6a00fdcef2
 command: |-
-  if [ -z "${MASTER_ADDR:-}" ]; then echo "MASTER_ADDR is required"; exit 1; fi
   apt-get update
   for port in $(ss -tlnp 2>/dev/null | awk 'NR>1 {split($4,a,":"); print a[length(a)]}' | sort -un); do
       if [ "$port" -ge 29500 ] 2>/dev/null && [ "$port" -le 65535 ]; then
@@ -39,18 +38,18 @@ parameters:
     inference: [4, 5, 6, 7] # node 0: global GPUs 4-7
 
   server:
-    train_url: "http://__MASTER_ADDR__"   # resolved at runtime → node 0
+    train_url: http://localhost       # base URL for train servers
     train_port: 5000                     # rank i serves on train_port + i
     rollout_url: http://localhost         # controller runs on same node as rollout
     rollout_port: 7000
     weights_dir: /dev/shm/vllm_weights
     weight_sync:
-      backend: rdma
-      master_address: __MASTER_ADDR__    # resolved at runtime → node 0 hostname
+      backend: nccl
+      master_address: 127.0.0.1    # resolved at runtime → node 0 hostname
       master_port: 6000
       packed: true
       max_nccl_params: 70000000000
-      transport: ibverbs
+      transport: mock
       num_nodes: 1
       transport_init:
         device_index: 0               # ibverbs: NIC index
