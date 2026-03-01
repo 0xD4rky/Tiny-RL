@@ -1,0 +1,89 @@
+name: test-interactive-image
+image: mosaicml/dle:nightly-latest
+scheduling:
+  priority: low
+  resumable: false
+  preemptible: true
+  max_duration: 1
+compute:
+  gpus: 8
+  cluster: r5z2p1
+env_variables:
+  WANDB_API_KEY: 06d47912179062d79bdbe20e333a8a6a00fdcef2
+command: |-
+  if [ -z "${MASTER_ADDR:-}" ]; then echo "MASTER_ADDR is required"; exit 1; fi
+  apt-get update
+  for port in $(ss -tlnp 2>/dev/null | awk 'NR>1 {split($4,a,":"); print a[length(a)]}' | sort -un); do
+      if [ "$port" -ge 29500 ] 2>/dev/null && [ "$port" -le 65535 ]; then
+          fuser -k "$port"/tcp 2>/dev/null || true
+      fi
+  done
+  git clone -b xiaohan/rdma-weight-sync https://github.com/XiaohanZhangCMU/Tiny-RL.git
+  cd Tiny-RL
+  pip install uv 
+  uv sync 
+  TORCH_COMPILE=1 uv run src/launch.py --config /mnt/config/parameters.yaml 
+
+parameters:
+  model:
+    name: Qwen/Qwen3-1.7B
+    trust_remote_code: false
+    bf16: true
+  
+  dataset:
+    name: qwedsacf/competition_math
+    max_rows: null
+  
+  gpu_split:
+    train: [0, 1, 2, 3]          # node 0: global GPUs 0-3
+    inference: [4, 5, 6, 7] # node 0: global GPUs 4-7
+
+  server:
+    train_url: "http://__MASTER_ADDR__"   # resolved at runtime → node 0
+    train_port: 5000                     # rank i serves on train_port + i
+    rollout_url: http://localhost         # controller runs on same node as rollout
+    rollout_port: 7000
+    weights_dir: /dev/shm/vllm_weights
+    weight_sync:
+      backend: rdma
+      master_address: __MASTER_ADDR__    # resolved at runtime → node 0 hostname
+      master_port: 6000
+      packed: true
+      max_nccl_params: 70000000000
+      transport: ibverbs
+      num_nodes: 1
+      transport_init:
+        device_index: 0               # ibverbs: NIC index
+        provider: ""                  # libfabric: e.g. verbs;ofi_rxm
+  
+  training:
+    seed: 42
+    lr: 1e-5
+    train_batch_size: 4
+    grad_acc_steps: 4
+    epochs_per_step: 1
+    max_norm: 1.0
+    checkpoint_path: ./output
+    checkpoint_interval: 20
+  
+  loss:
+    name: grpo  # grpo, dapo or reinforce_pp
+    clip_eps: 0.3
+    kl_beta: 0.01
+    # dapo-specific
+    clip_low: 0.2
+    clip_high: 0.28
+  
+  rollout:
+    group_size: 12
+    rollouts_per_step: 32
+    max_length: 2048
+    top_p: 1.0
+    temperature: 1.0
+    gpu_memory_utilization: 0.3
+    sync_interval: 2
+  
+  wandb:
+    project: RL
+    run_name: grpo
+
