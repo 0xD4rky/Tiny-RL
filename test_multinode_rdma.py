@@ -13,7 +13,21 @@ def is_master(master: str) -> bool:
         return False
 
 master = os.environ["MASTER_ADDR"]
-role = "server" if is_master(master) else "client"
+
+# Determine role: prefer NODE_RANK/RANK env vars (set by MosaicML platform)
+# over hostname matching, which can fail due to DNS naming mismatches.
+node_rank = os.getenv("NODE_RANK")
+if node_rank is None:
+    # Fall back: RANK with 0 == master node's first process
+    node_rank = os.getenv("RANK")
+if node_rank is not None:
+    role = "server" if int(node_rank) == 0 else "client"
+else:
+    role = "server" if is_master(master) else "client"
+
+print(f"[debug] hostname={socket.gethostname()} MASTER_ADDR={master} "
+      f"NODE_RANK={os.getenv('NODE_RANK')} RANK={os.getenv('RANK')} "
+      f"role={role}", flush=True)
 port, ctrl = int(os.getenv("RDMA_PORT", "6000")), int(os.getenv("RDMA_CTRL_PORT", "6001"))
 t = build_transport(os.getenv("RDMA_BACKEND", "rdma"))
 r = t.init_endpoint(
