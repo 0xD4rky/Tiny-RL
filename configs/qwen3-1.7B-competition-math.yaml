@@ -57,7 +57,6 @@ parameters:
       max_nccl_params: 70000000000
       transport: ibverbs
       num_nodes: 2
-      force_disk_fallback: false
       transport_init:
         device_index: 0               # ibverbs: NIC index
         provider: ""                  # libfabric: e.g. verbs;ofi_rxm

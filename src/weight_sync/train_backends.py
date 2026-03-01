@@ -233,7 +233,6 @@ class RdmaTrainerBackend:
         if self.server.weight_sync_mode != "rdma":
             return {"status": "ok", "mode": self.server.weight_sync_mode, "reason": self.server.weight_sync_reason}
 
-        # Phase-2 mock: run transport transfer call for correctness flow.
         ops = kwargs.get("ops", [])
         res: dict[str, Any] = {"status": "ok", "mode": "rdma", "rank": self.server.rank}
         param_ptrs: dict[str, int] = {}
@@ -267,8 +266,7 @@ class RdmaTrainerBackend:
 
             res = self.transport.transfer(parsed_ops)
         self.server.dist_barrier()
-        # Keep correctness: fallback to disk materialization until real RDMA copy backend exists.
-        if res.get("status") != "ok" or self.server.weight_sync_cfg.get("force_disk_fallback", True):
+        if res.get("status") != "ok":
             disk_res = self.server.save_weights_to_disk()
             return {
                 "status": "ok",

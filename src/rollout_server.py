@@ -208,9 +208,10 @@ class RolloutServer:
         return {"status": "ok", "mrs": mrs}
 
     def apply_rdma_routes(self, routes: list[dict[str, Any]], step: int) -> dict[str, Any]:
-        # Phase-2 mock path: validate route format and acknowledge sync version.
         total_bytes = sum(int(r.get("nbytes", 0)) for r in routes)
         self.last_synced_step = max(self.last_synced_step, int(step))
+        log.info("RDMA weight sync step %d: %d routes, %.1f MB",
+                 step, len(routes), total_bytes / (1024 * 1024))
         return {
             "status": "ok",
             "mode": "rdma",
