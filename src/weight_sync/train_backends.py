@@ -128,7 +128,7 @@ class NcclTrainerBackend:
                 from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
 
                 NCCLWeightTransferEngine.trainer_send_weights(
-                    iterator=full_params.items(),
+                    iterator=iter(full_params.items()),
                     group=self._group,
                     packed=packed,
                 )
