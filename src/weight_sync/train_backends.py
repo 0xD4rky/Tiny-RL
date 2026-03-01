@@ -119,18 +119,24 @@ class NcclTrainerBackend:
     def transfer(self, **kwargs) -> dict[str, Any]:
         if self.server.weight_sync_mode != "nccl":
             return {"status": "ok", "mode": "disk", "reason": self.server.weight_sync_reason}
-        if self._group is None:
-            raise RuntimeError("NCCL trainer transfer group is not initialized")
 
         packed = bool(kwargs.get("packed", self.server.weight_sync_packed))
+        # All ranks enter summon_full_params (collective all-gather).
+        # Only rank 0 has the NCCL group and does the broadcast.
         with self.server.summon_full_params(rank0_only=True) as full_params:
-            if self.server.rank == 0:
-                from vllm.distributed.weight_transfer.nccl_engine import NCCLWeightTransferEngine
+            if self.server.rank == 0 and self._group is not None:
+                from vllm.distributed.weight_transfer.nccl_engine import (
+                    NCCLTrainerSendWeightsArgs,
+                    NCCLWeightTransferEngine,
+                )
 
-                NCCLWeightTransferEngine.trainer_send_weights(
-                    iterator=full_params.items(),
+                trainer_args = NCCLTrainerSendWeightsArgs(
                     group=self._group,
                     packed=packed,
+                )
+                NCCLWeightTransferEngine.trainer_send_weights(
+                    iterator=full_params.items(),
+                    trainer_args=trainer_args,
                 )
 
         self.server.dist_barrier()
