@@ -89,7 +89,11 @@ class TrainServer:
         self.rank = dist.get_rank()
         self.device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
         self.weight_sync_cfg = wcfg
-        self.max_nccl_params = int(wcfg.get("max_nccl_params", 70_000_000_000))
+        max_nccl_params = wcfg.get("max_nccl_params", 70_000_000_000)
+        try:
+            self.max_nccl_params = int(max_nccl_params)
+        except (TypeError, ValueError):
+            self.max_nccl_params = int(float(max_nccl_params))
         self.weight_sync_packed = bool(wcfg.get("packed", True))
 
         # policy model (trainable, FSDP2)

@@ -1,0 +1,17 @@
+name: tinyrl-weight-sync-test-minimal
+image: mosaicml/dle:nightly-latest
+scheduling:
+  priority: low
+  resumable: false
+  preemptible: true
+  max_duration: 1
+compute:
+  gpus: 1
+  cluster: r5z2p1
+command: |-
+  set -euo pipefail
+  git clone -b xiaohan/rdma-weight-sync https://github.com/XiaohanZhangCMU/Tiny-RL.git
+  cd Tiny-RL
+  pip install uv
+  uv sync
+  uv run python test.py
