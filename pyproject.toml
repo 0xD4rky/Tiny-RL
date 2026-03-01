@@ -5,6 +5,7 @@ requires-python = ">=3.12, <3.14"
 dependencies = [
     "torch>=2.4",
     "transformers>=4.45",
+    "hf_transfer",
     "datasets>=3.0",
     "vllm>=0.6",
     "wandb>=0.18",

@@ -1,63 +1,83 @@
-model:
-  name: Qwen/Qwen3-1.7B
-  trust_remote_code: false
-  bf16: true
+name: test-interactive-image
+image: mosaicml/dle:nightly-latest
+scheduling:
+  priority: low
+  resumable: false
+  preemptible: true
+  max_duration: 1
+compute:
+  gpus: 16
+  cluster: r5z2p1
+env_variables:
+  WANDB_API_KEY: 06d47912179062d79bdbe20e333a8a6a00fdcef2
+command: |-
+  git clone -b xiaohan/rdma-weight-sync https://github.com/XiaohanZhangCMU/Tiny-RL.git
+  cd Tiny-RL
+  pip install uv 
+  uv sync 
+  TORCH_COMPILE=1 uv run src/launch.py --config /mnt/config/parameters.yaml 
 
-dataset:
-  name: qwedsacf/competition_math
-  max_rows: null
+parameters:
+  model:
+    name: Qwen/Qwen3-1.7B
+    trust_remote_code: false
+    bf16: true
+  
+  dataset:
+    name: qwedsacf/competition_math
+    max_rows: null
+  
+  gpu_split:
+    train: [0, 1, 2, 3]              # GPUs for FSDP training
+    inference: [4, 5, 6, 7]          # GPUs for vLLM inference
+  
+  server:
+    train_url: http://localhost       # base URL for train servers
+    train_port: 5000                  # rank i serves on train_port + i
+    rollout_url: http://localhost
+    rollout_port: 7000
+    weights_dir: /dev/shm/vllm_weights  # RAM filesystem — eliminates disk I/O on weight sync
+    weight_sync:
+      backend: nccl
+      master_address: 127.0.0.1
+      master_port: 6000
+      packed: true
+      max_nccl_params: 70000000000    # fallback to disk sync for larger models
+      transport: mock                 # mock|ibverbs|libfabric|auto|rdma(alias of auto)
+      num_nodes: 1                    # rdma backend falls back to NCCL when <=1
+      force_disk_fallback: true       # keep correctness until real RDMA writes are wired
+      transport_init:
+        device_index: 0               # ibverbs: NIC index
+        provider: ""                  # libfabric: e.g. verbs;ofi_rxm
+  
+  training:
+    seed: 42
+    lr: 1e-5
+    train_batch_size: 4
+    grad_acc_steps: 4
+    epochs_per_step: 1
+    max_norm: 1.0
+    checkpoint_path: ./output
+    checkpoint_interval: 20
+  
+  loss:
+    name: grpo  # grpo, dapo or reinforce_pp
+    clip_eps: 0.3
+    kl_beta: 0.01
+    # dapo-specific
+    clip_low: 0.2
+    clip_high: 0.28
+  
+  rollout:
+    group_size: 12
+    rollouts_per_step: 32
+    max_length: 2048
+    top_p: 1.0
+    temperature: 1.0
+    gpu_memory_utilization: 0.3
+    sync_interval: 2
+  
+  wandb:
+    project: RL
+    run_name: grpo
 
-gpu_split:
-  train: [0, 1, 2, 3]              # GPUs for FSDP training
-  inference: [4, 5, 6, 7]          # GPUs for vLLM inference
-
-server:
-  train_url: http://localhost       # base URL for train servers
-  train_port: 5000                  # rank i serves on train_port + i
-  rollout_url: http://localhost
-  rollout_port: 7000
-  weights_dir: /dev/shm/vllm_weights  # RAM filesystem — eliminates disk I/O on weight sync
-  weight_sync:
-    backend: nccl
-    master_address: 127.0.0.1
-    master_port: 6000
-    packed: true
-    max_nccl_params: 70000000000    # fallback to disk sync for larger models
-    transport: mock                 # mock|ibverbs|libfabric|auto|rdma(alias of auto)
-    num_nodes: 1                    # rdma backend falls back to NCCL when <=1
-    force_disk_fallback: true       # keep correctness until real RDMA writes are wired
-    transport_init:
-      device_index: 0               # ibverbs: NIC index
-      provider: ""                  # libfabric: e.g. verbs;ofi_rxm
-
-
-training:
-  seed: 42
-  lr: 1e-5
-  train_batch_size: 4
-  grad_acc_steps: 4
-  epochs_per_step: 1
-  max_norm: 1.0
-  checkpoint_path: ./output
-  checkpoint_interval: 20
-
-loss:
-  name: grpo  # grpo, dapo or reinforce_pp
-  clip_eps: 0.3
-  kl_beta: 0.01
-  # dapo-specific
-  clip_low: 0.2
-  clip_high: 0.28
-
-rollout:
-  group_size: 12
-  rollouts_per_step: 32
-  max_length: 2048
-  top_p: 1.0
-  temperature: 1.0
-  gpu_memory_utilization: 0.3
-  sync_interval: 2
-
-wandb:
-  project: RL
-  run_name: grpo
