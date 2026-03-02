@@ -287,7 +287,6 @@ async def run(cfg: dict):
                 await rollout_engine.reload_from_disk(weights_dir)
                 sync_time = time.perf_counter() - t_sync
                 log.info("Rollout server reloaded from %s (%.1fs)", weights_dir, sync_time)
-            wandb.log({"sync/weight_sync_time": sync_time}, step=k)
         else:
             sync_time = 0.0
 

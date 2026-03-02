@@ -57,10 +57,10 @@ parameters:
   
   training:
     seed: 42
-    lr: 1e-5
+    lr: 2e-5
     train_batch_size: 16
     grad_acc_steps: 4
-    epochs_per_step: 2
+    epochs_per_step: 1
     max_norm: 1.0
     checkpoint_path: ./output
     checkpoint_interval: 20
