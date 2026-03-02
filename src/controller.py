@@ -184,23 +184,36 @@ async def run(cfg: dict):
 
     # ── main loop ────────────────────────────────────────────────────
     for k, batch in enumerate(loader):
+        t_step = time.perf_counter()
         questions = list(batch["problem"])
         answers = list(batch["answer"])
 
         # 1) generate rollouts from rollout server
+        t_generate = time.perf_counter()
         rollout_resp = await rollout_engine.generate(questions, answers)
+        generate_time = time.perf_counter() - t_generate
         rollout_batches = rollout_resp["rollout_batches"]
         rollout_tps = float(rollout_resp["rollout_tokens_per_sec"])
         reward_mean = float(rollout_resp["reward_mean"])
         accuracy = float(rollout_resp["accuracy"])
-        log.info("Step %d: reward=%.3f acc=%.1f%% | rollout %.0f tok/s",
-                 k, reward_mean, accuracy * 100, rollout_tps)
+        log.info(
+            "Step %d: reward=%.3f acc=%.1f%% | rollout %.0f tok/s (generate %.2fs)",
+            k,
+            reward_mean,
+            accuracy * 100,
+            rollout_tps,
+            generate_time,
+        )
 
         # 2) send to train servers  (all ranks receive the same data)
+        t_push = time.perf_counter()
         await train_engine.create_online_dataset(rollout_batches)
+        push_time = time.perf_counter() - t_push
 
         # 3) train
+        t_train = time.perf_counter()
         train_results = await train_engine.train_1_iter()
+        train_time = time.perf_counter() - t_train
         metrics = train_results[0].get("metrics", {})
 
         if metrics:
@@ -208,12 +221,24 @@ async def run(cfg: dict):
                 "rollout/reward_mean": reward_mean,
                 "rollout/accuracy": accuracy,
                 "rollout/tokens_per_sec": rollout_tps,
+                "timing/generate_time_s": generate_time,
+                "timing/dataset_push_time_s": push_time,
+                "timing/train_rpc_time_s": train_time,
                 "train/loss": metrics["loss"],
                 "train/kl": metrics["kl"],
                 "train/grad_norm": metrics["grad_norm"],
                 "train/tokens_per_sec": metrics.get("tokens_per_sec"),
                 "train/mfu": metrics.get("mfu"),
             }, step=k)
+        else:
+            wandb.log(
+                {
+                    "timing/generate_time_s": generate_time,
+                    "timing/dataset_push_time_s": push_time,
+                    "timing/train_rpc_time_s": train_time,
+                },
+                step=k,
+            )
 
         # 4) sync weights
         if (k + 1) % sync_interval == 0:
@@ -263,6 +288,29 @@ async def run(cfg: dict):
                 sync_time = time.perf_counter() - t_sync
                 log.info("Rollout server reloaded from %s (%.1fs)", weights_dir, sync_time)
             wandb.log({"sync/weight_sync_time": sync_time}, step=k)
+        else:
+            sync_time = 0.0
+
+        step_total = time.perf_counter() - t_step
+        log.info(
+            "Step %d timing: total %.2fs | generate %.2fs | push %.2fs | train_rpc %.2fs | sync %.2fs",
+            k,
+            step_total,
+            generate_time,
+            push_time,
+            train_time,
+            sync_time,
+        )
+        wandb.log(
+            {
+                "timing/step_total_s": step_total,
+                "timing/generate_time_s": generate_time,
+                "timing/dataset_push_time_s": push_time,
+                "timing/train_rpc_time_s": train_time,
+                "timing/sync_time_s": sync_time,
+            },
+            step=k,
+        )
 
         # 5) checkpoint
         if (k + 1) % tcfg["checkpoint_interval"] == 0:

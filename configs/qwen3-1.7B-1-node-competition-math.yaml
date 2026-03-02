@@ -4,7 +4,7 @@ scheduling:
   priority: low
   resumable: false
   preemptible: true
-  max_duration: 1
+  max_duration: 3
 compute:
   gpus: 8
   cluster: r5z2p1
